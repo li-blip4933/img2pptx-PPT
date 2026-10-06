@@ -4,7 +4,9 @@
 
 全部在本机运行，图片不会上传到任何地方。
 
-![流程示意](docs/pipeline.png)
+![流程示意](docs/pipeline.jpg)
+
+上图是一张真实的转换结果（在 macOS 上用 RapidOCR + LaMa 运行）。原图见 [docs/example.jpg](docs/example.jpg)，可以拿它试跑。
 
 ## 它做了什么
 
