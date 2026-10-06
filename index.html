@@ -1,0 +1,642 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>图片转可编辑 PPT</title>
+<style>
+  :root {
+    --paper: #F3F5F9;
+    --card: #FFFFFF;
+    --ink: #131A2B;
+    --soft: #5B6578;
+    --line: #D3DAE6;
+    --text-layer: #D6336C;      /* 文字层 */
+    --icon-layer: #0B9E73;      /* 图标层 */
+    --pic-layer: #1B6FC2;       /* 图片层 */
+    --go: #D9480F;              /* 主操作：PPT 的橙 */
+    --go-dark: #B83B0A;
+    --serif: "Songti SC", "STSong", "Noto Serif CJK SC", "Source Han Serif SC", "SimSun", serif;
+    --sans: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+    --mono: "SF Mono", "Menlo", "Consolas", "Noto Sans Mono CJK SC", monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--paper); color: var(--ink);
+    font-family: var(--sans); font-size: 15px; line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 36px 24px 80px; }
+
+  /* ---------- 页头 ---------- */
+  header { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; flex-wrap: wrap;
+           padding-bottom: 18px; border-bottom: 2px solid var(--ink); }
+  h1 { font-family: var(--serif); font-weight: 900; font-size: 34px; letter-spacing: .02em; margin: 0; line-height: 1.15; }
+  h1 em { font-style: normal; color: var(--go); }
+  .env { font-family: var(--mono); font-size: 12px; color: var(--soft); text-align: right; line-height: 1.7; }
+  .env b { color: var(--ink); font-weight: 600; }
+  .env .warn { color: var(--go-dark); }
+
+  section { margin-top: 28px; }
+  [hidden] { display: none !important; }
+
+  /* ---------- 上传框：一张 16:9 的"空白幻灯片"，四角是裁切标记 ---------- */
+  .drop {
+    position: relative; display: block; width: 100%; aspect-ratio: 16 / 7; min-height: 220px;
+    background: var(--card); border: 1px solid var(--line); cursor: pointer;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .drop:hover, .drop.over, .drop:focus-within { border-color: var(--ink); box-shadow: 6px 6px 0 var(--line); }
+  .drop.over { background: #FFF8F3; border-color: var(--go); box-shadow: 6px 6px 0 #F6D5C3; }
+  .drop input { position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%; }
+  .mark { position: absolute; width: 18px; height: 18px; border: 2px solid var(--ink); pointer-events: none; }
+  .mark.tl { top: 12px; left: 12px; border-right: 0; border-bottom: 0; }
+  .mark.tr { top: 12px; right: 12px; border-left: 0; border-bottom: 0; }
+  .mark.bl { bottom: 12px; left: 12px; border-right: 0; border-top: 0; }
+  .mark.br { bottom: 12px; right: 12px; border-left: 0; border-top: 0; }
+  .drop.compact { aspect-ratio: auto; min-height: 0; height: 132px; }
+  .drop.compact .drop-inner strong { font-size: 19px; }
+  .drop-inner { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+                gap: 6px; pointer-events: none; text-align: center; padding: 20px; }
+  .drop-inner strong { font-family: var(--serif); font-size: 24px; font-weight: 900; }
+  .drop-inner span { color: var(--soft); font-size: 13px; }
+
+  /* ---------- 待转换的图片 ---------- */
+  .queue { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px; margin-top: 18px; }
+  .thumb { background: var(--card); border: 1px solid var(--line); padding: 8px; position: relative; }
+  .thumb img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: contain; background: #EDEFF4; }
+  .thumb .nm { font-size: 12px; margin-top: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .thumb .no { position: absolute; top: 8px; left: 8px; background: var(--ink); color: #fff; font-family: var(--mono);
+               font-size: 11px; padding: 1px 7px; }
+  .thumb button { position: absolute; top: 8px; right: 8px; width: 24px; height: 24px; border: 0; background: rgba(19,26,43,.78);
+                  color: #fff; cursor: pointer; font-size: 15px; line-height: 1; }
+  .thumb button:hover { background: var(--go); }
+
+  /* ---------- 选项 + 开始 ---------- */
+  .bar { display: flex; align-items: center; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin-top: 20px; }
+  .opts { display: flex; gap: 22px; flex-wrap: wrap; align-items: center; font-size: 14px; }
+  .opts label { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }
+  .opts input { width: 16px; height: 16px; accent-color: var(--ink); }
+  .opts .hint { color: var(--soft); font-size: 12px; }
+  .btn { font: inherit; font-weight: 600; border: 2px solid var(--ink); background: var(--card); color: var(--ink);
+         padding: 10px 22px; cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn:hover { background: var(--ink); color: #fff; }
+  .btn.go { background: var(--go); border-color: var(--go); color: #fff; font-size: 16px; padding: 12px 30px; }
+  .btn.go:hover { background: var(--go-dark); border-color: var(--go-dark); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  :focus-visible { outline: 3px solid #7FB2EF; outline-offset: 2px; }
+
+  /* ---------- 进度 ---------- */
+  .progress { background: var(--card); border: 1px solid var(--line); padding: 22px 24px; }
+  .progress .row { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+  .progress .what { font-family: var(--serif); font-weight: 900; font-size: 20px; }
+  .progress .clock { font-family: var(--mono); font-size: 13px; color: var(--soft); }
+  .track { height: 8px; background: #E4E8F0; margin-top: 14px; overflow: hidden; }
+  .fill { height: 100%; width: 0; background: var(--ink); transition: width .5s ease; }
+  .progress p { margin: 10px 0 0; font-size: 13px; color: var(--soft); }
+
+  .alert { border: 2px solid var(--go); background: #FFF4EE; padding: 14px 18px; font-size: 14px; }
+  .alert b { display: block; margin-bottom: 2px; }
+
+  /* ---------- 结果 ---------- */
+  .done-bar { display: flex; align-items: center; justify-content: space-between; gap: 18px; flex-wrap: wrap;
+              background: var(--ink); color: #fff; padding: 18px 22px; }
+  .done-bar .sum { font-family: var(--serif); font-weight: 900; font-size: 20px; }
+  .done-bar .sub { font-family: var(--mono); font-size: 12px; opacity: .75; }
+  .done-bar .btn { border-color: #fff; }
+  .done-bar .btn.ghost { background: transparent; color: #fff; }
+  .done-bar .btn.ghost:hover { background: #fff; color: var(--ink); }
+  .actions { display: flex; gap: 10px; flex-wrap: wrap; }
+
+  .page { margin-top: 22px; background: var(--card); border: 1px solid var(--line); }
+  .page-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
+               padding: 12px 16px; border-bottom: 1px solid var(--line); }
+  .page-head .title { font-weight: 600; font-size: 14px; }
+  .page-head .title small { font-family: var(--mono); font-weight: 400; color: var(--soft); margin-left: 8px; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { font: inherit; font-size: 13px; border: 1.5px solid var(--c); color: var(--c); background: transparent;
+          padding: 3px 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+  .chip b { font-family: var(--mono); font-weight: 600; }
+  .chip[aria-pressed="true"] { background: var(--c); color: #fff; }
+  .chip.t { --c: var(--text-layer); } .chip.i { --c: var(--icon-layer); } .chip.p { --c: var(--pic-layer); }
+  .chip.base { --c: var(--ink); }
+  .stage { position: relative; line-height: 0; background: #EDEFF4; }
+  .stage img { width: 100%; height: auto; display: block; }
+  .box { position: absolute; border: 2px solid var(--c); background: color-mix(in srgb, var(--c) 12%, transparent);
+         cursor: default; transition: transform .2s cubic-bezier(.2, .9, .3, 1.3), box-shadow .2s, background-color .2s; }
+  .box.t { --c: var(--text-layer); } .box.i { --c: var(--icon-layer); } .box.p { --c: var(--pic-layer); }
+  .box.r { --c: #7A8497; border-style: dashed; border-width: 1.5px; background: transparent; }
+  .box.weak { border-style: dashed; }
+  .stage.hide-t .box.t, .stage.hide-i .box.i, .stage.hide-p .box.p, .stage.hide-r .box.r { display: none; }
+  /* 每个框的置信分：平时只在图标 / 图片 / 未抠出的框上显示小标签，悬停时放大 */
+  .box .score { position: absolute; left: -2px; bottom: 100%; background: var(--c); color: #fff; font: 600 10px/1 var(--mono);
+                padding: 2px 4px; pointer-events: none; transition: transform .15s; transform-origin: left bottom; }
+  .box.t .score { display: none; }
+  .box.t.weak .score, .box.t:hover .score { display: block; }
+  .box:hover .score { transform: scale(1.35); }
+  .chip.r { --c: #7A8497; }
+  /* 框刚被识别出来时：弹一下 */
+  .box.pop { animation: pop .42s cubic-bezier(.2, 1.5, .4, 1) both; }
+  @keyframes pop { from { opacity: 0; transform: scale(.55); } to { opacity: 1; transform: scale(1); } }
+  /* 鼠标移上去：图标和图片像被"拿起来"一样浮起，露出抠出来的那一块；文字框加深并显示内容 */
+  .box .cut { position: absolute; inset: 0; background-repeat: no-repeat; opacity: 0; transition: opacity .15s; }
+  .box:hover { z-index: 6; }
+  .box.i:hover, .box.p:hover { transform: translateY(-7px) scale(1.06); background-color: #fff;
+                               box-shadow: 0 16px 30px -6px rgba(19, 26, 43, .45), 0 0 0 4px color-mix(in srgb, var(--c) 25%, transparent); }
+  .box.i:hover .cut, .box.p:hover .cut { opacity: 1; }
+  .box.t:hover { transform: translateY(-2px); background: color-mix(in srgb, var(--c) 26%, transparent);
+                 box-shadow: 0 6px 14px -4px color-mix(in srgb, var(--c) 60%, transparent); }
+  .box::after { content: attr(data-tip); position: absolute; left: -2px; top: calc(100% + 8px); z-index: 7;
+                background: var(--ink); color: #fff; font: 12px/1.5 var(--sans); padding: 4px 9px; white-space: pre;
+                max-width: 420px; overflow: hidden; text-overflow: ellipsis;
+                opacity: 0; transform: translateY(-4px); transition: opacity .15s, transform .15s; pointer-events: none; }
+  .box.up::after { top: auto; bottom: calc(100% + 8px); }
+  .box:hover::after { opacity: 1; transform: none; }
+  .box::before { content: ""; position: absolute; inset: -2px; border: 2px solid var(--c); opacity: 0; pointer-events: none; }
+  .box:hover::before { animation: ring .7s ease-out; }
+  @keyframes ring { from { opacity: .9; inset: -2px; } to { opacity: 0; inset: -14px; } }
+
+  /* ---------- 识别过程 ---------- */
+  .live { margin-top: 16px; background: var(--card); border: 1px solid var(--line); }
+  /* 手动调整 */
+  .stage.editing > .box.i, .stage.editing > .box.p, .stage.editing > .box.r { display: none; }
+  .stage.editing > .box.t { pointer-events: none; opacity: .35; }
+  .edit-layer { position: absolute; inset: 0; display: none; cursor: crosshair; touch-action: none; }
+  .stage.editing .edit-layer { display: block; }
+  .ebox { position: absolute; border: 2px solid var(--c); background: color-mix(in srgb, var(--c) 14%, transparent); cursor: move; box-sizing: border-box; }
+  .ebox.i { --c: var(--icon-layer); } .ebox.p { --c: var(--pic-layer); }
+  .ebox.r { --c: #7A8497; border-style: dashed; border-width: 1.5px; background: transparent; cursor: copy; }
+  .ebox.changed { border-style: dashed; }
+  .ebox.sel { background: color-mix(in srgb, var(--c) 26%, transparent); box-shadow: 0 0 0 2px #fff, 0 0 0 4px var(--c); z-index: 5; }
+  .ebox .h { position: absolute; width: 12px; height: 12px; background: #fff; border: 2px solid var(--c); display: none; }
+  .ebox.sel .h { display: block; }
+  .ebox .h.nw { left: -7px; top: -7px; cursor: nwse-resize; } .ebox .h.ne { right: -7px; top: -7px; cursor: nesw-resize; }
+  .ebox .h.sw { left: -7px; bottom: -7px; cursor: nesw-resize; } .ebox .h.se { right: -7px; bottom: -7px; cursor: nwse-resize; }
+  .ebox .lab { position: absolute; left: -2px; bottom: 100%; background: var(--c); color: #fff; font: 600 10px/1 var(--mono); padding: 3px 5px; white-space: nowrap; }
+  .edit-bar { display: none; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 16px; border-top: 1px solid var(--line); font-size: 13px; line-height: 1.5; }
+  .page.editing .edit-bar { display: flex; }
+  .edit-bar button { font: inherit; font-size: 13px; padding: 5px 12px; border: 1.5px solid var(--ink); background: var(--card); color: var(--ink); cursor: pointer; }
+  .edit-bar button[aria-pressed="true"] { background: var(--ink); color: #fff; }
+  .edit-bar button:disabled { opacity: .4; cursor: not-allowed; }
+  .edit-bar .tip { color: var(--soft); flex-basis: 100%; }
+  .live .stage { overflow: hidden; }
+  .scan { position: absolute; left: 0; right: 0; height: 26%; top: -26%; pointer-events: none; z-index: 4;
+          background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--c) 10%, transparent) 55%, color-mix(in srgb, var(--c) 34%, transparent));
+          border-bottom: 2px solid var(--c); box-shadow: 0 6px 18px color-mix(in srgb, var(--c) 55%, transparent);
+          animation: sweep 2.4s cubic-bezier(.45, 0, .55, 1) infinite; }
+  @keyframes sweep { from { top: -26%; } to { top: 100%; } }
+  .stage[data-stage="ocr"] .scan, .stage[data-stage="text"] .scan { --c: var(--text-layer); }
+  .stage[data-stage="picture"] .scan { --c: var(--pic-layer); }
+  .stage[data-stage="icon"] .scan { --c: var(--icon-layer); }
+  .stage[data-stage="erase"] .scan { --c: var(--ink); }
+  .stage[data-stage="upload"] .scan { --c: var(--soft); }
+  .stage[data-stage="erase"] img { animation: breathe 1.6s ease-in-out infinite; }
+  @keyframes breathe { 50% { filter: saturate(.55) brightness(1.06); } }
+  .steps { list-style: none; display: flex; gap: 0; margin: 16px 0 0; padding: 0; flex-wrap: wrap; }
+  .steps li { flex: 1 1 150px; font-size: 13px; color: var(--soft); padding: 8px 10px 8px 0; border-top: 3px solid #E4E8F0;
+              display: flex; align-items: center; gap: 8px; transition: color .2s, border-color .3s; }
+  .steps li i { width: 9px; height: 9px; border-radius: 50%; background: #C9D0DD; flex: none; }
+  .steps li b { font-family: var(--mono); font-weight: 600; margin-left: auto; padding-right: 10px; }
+  .steps li.on { color: var(--ink); font-weight: 600; border-color: var(--c); }
+  .steps li.on i { background: var(--c); animation: pulse 1s ease-in-out infinite; }
+  .steps li.ok { color: var(--ink); border-color: var(--c); }
+  .steps li.ok i { background: var(--c); }
+  @keyframes pulse { 50% { transform: scale(1.9); opacity: .45; } }
+  .steps .s-t { --c: var(--text-layer); } .steps .s-p { --c: var(--pic-layer); } .steps .s-i { --c: var(--icon-layer); } .steps .s-e { --c: var(--ink); }
+  @media (prefers-reduced-motion: reduce) {
+    .scan, .box.pop, .steps li.on i, .stage[data-stage="erase"] img, .box:hover::before { animation: none !important; }
+    .scan { display: none; }
+  }
+  .note { font-size: 12px; color: var(--soft); padding: 10px 16px; border-top: 1px solid var(--line); }
+
+  footer { margin-top: 44px; font-size: 12px; color: var(--soft); border-top: 1px solid var(--line); padding-top: 14px; }
+
+  @media (max-width: 640px) {
+    h1 { font-size: 26px; } .env { text-align: left; }
+    .drop { aspect-ratio: 4 / 3; }
+  }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>图片转<em>可编辑</em> PPT</h1>
+    <div class="env" id="env">正在检查本机环境…</div>
+  </header>
+
+  <!-- 第一步：选图 -->
+  <section id="pick">
+    <label class="drop" id="drop">
+      <input type="file" id="file" accept=".png,.jpg,.jpeg,.webp,.bmp,image/*" multiple aria-label="选择幻灯片图片">
+      <i class="mark tl"></i><i class="mark tr"></i><i class="mark bl"></i><i class="mark br"></i>
+      <div class="drop-inner">
+        <strong>把幻灯片图片拖到这里</strong>
+        <span>或者点击选择。可以一次放多张，每张图变成一页。PNG / JPG / WebP</span>
+      </div>
+    </label>
+
+    <div class="queue" id="queue"></div>
+
+    <div class="bar" id="bar" hidden>
+      <div class="opts">
+        <label><input type="checkbox" id="optIcons" checked> 抠出图标</label>
+        <label><input type="checkbox" id="optPics" checked> 抠出照片和插画</label>
+        <label><input type="checkbox" id="optFast"> 快速模式 <span class="hint">纯色背景够用，复杂背景会糊</span></label>
+      </div>
+      <button class="btn go" id="start">开始转换</button>
+    </div>
+    <div class="alert" id="pickErr" hidden style="margin-top:16px"></div>
+  </section>
+
+  <!-- 第二步：进度 -->
+  <section id="run" hidden>
+    <div class="progress">
+      <div class="row"><span class="what" id="what">正在上传…</span><span class="clock" id="clock">0 秒</span></div>
+      <div class="track"><div class="fill" id="fill"></div></div>
+      <ol class="steps" id="steps">
+        <li class="s-t" data-k="text"><i></i>识别文字<b></b></li>
+        <li class="s-p" data-k="picture"><i></i>找照片和插画<b></b></li>
+        <li class="s-i" data-k="icon"><i></i>找图标<b></b></li>
+        <li class="s-e" data-k="erase"><i></i>补全背景<b></b></li>
+      </ol>
+      <p id="runHint">识别文字、抠图、补全背景都在你的电脑上完成，图片不会上传到别处。</p>
+    </div>
+    <div class="live">
+      <div class="stage" id="liveStage" data-stage="upload"><img id="liveImg" alt="正在识别的图片"><div class="scan"></div></div>
+    </div>
+  </section>
+
+  <!-- 第三步：结果 -->
+  <section id="result" hidden>
+    <div class="done-bar">
+      <div>
+        <div class="sum" id="sum"></div>
+        <div class="sub" id="sub"></div>
+      </div>
+      <div class="actions">
+        <button class="btn" id="redo" hidden>按修改重新生成</button>
+        <a class="btn go" id="download" href="#">下载 PPTX</a>
+        <button class="btn ghost" id="again">再转一批</button>
+      </div>
+    </div>
+    <div id="pages"></div>
+  </section>
+
+  <footer>
+    彩色方框标出的是程序识别到的元素：在 PPT 里，每个框都是一个可以单独移动的对象。每个框左上角的数字是程序给它打的置信分（满分 100）：图标要到 55 分才会被抠出来，灰色虚线框是分数不够、留在底图里的候选。把鼠标移到框上可以看分项得分。没有框住的部分留在底图里，不能单独编辑。
+  </footer>
+  <footer style="border-top:none;margin-top:10px;padding-top:0">
+    <a href="#" id="quitApp" style="color:inherit">关闭程序</a>（用完点这里；直接关掉网页的话程序还在后台运行，下次打开更快）
+  </footer>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let files = [];            // 待转换的图片
+let timer = null;
+
+// ---------- 环境信息 ----------
+fetch('/api/info').then(r => r.json()).then(info => {
+  const ocr = info.ocr === 'rapidocr' ? '<b>RapidOCR</b>（中英文）' : '<b class="warn">Tesseract</b>（未装 RapidOCR，中文可能识别不了）';
+  const fill = info.lama ? '<b>LaMa 模型</b>' : '<b class="warn">快速算法</b>（未找到 LaMa 模型）';
+  $('env').innerHTML = `在本机运行 · 不联网<br>文字识别 ${ocr}<br>背景补全 ${fill}`;
+  if (!info.lama) { $('optFast').checked = true; $('optFast').disabled = true; }
+}).catch(() => { $('env').innerHTML = '<b class="warn">连不上本机服务</b><br>请确认 app.py 还在运行'; });
+
+// ---------- 选图 ----------
+const drop = $('drop');
+const okType = f => /\.(png|jpe?g|webp|bmp)$/i.test(f.name);
+function addFiles(list) {
+  const bad = [];
+  for (const f of list) (okType(f) ? files : bad).push(f);
+  showErr(bad.length ? `这些文件不是图片，已跳过：${bad.map(f => f.name).join('、')}` : '');
+  renderQueue();
+}
+function renderQueue() {
+  const q = $('queue'); q.innerHTML = '';
+  files.forEach((f, i) => {
+    const d = document.createElement('div'); d.className = 'thumb';
+    const img = document.createElement('img'); img.src = URL.createObjectURL(f); img.alt = '';
+    const no = document.createElement('span'); no.className = 'no'; no.textContent = `第 ${i + 1} 页`;
+    const rm = document.createElement('button'); rm.textContent = '×'; rm.title = '移除'; rm.setAttribute('aria-label', `移除 ${f.name}`);
+    rm.onclick = () => { files.splice(i, 1); renderQueue(); };
+    const nm = document.createElement('div'); nm.className = 'nm'; nm.textContent = f.name; nm.title = f.name;
+    d.append(img, no, rm, nm); q.append(d);
+  });
+  $('bar').hidden = files.length === 0;
+  drop.classList.toggle('compact', files.length > 0);
+  $('start').textContent = files.length > 1 ? `开始转换（${files.length} 张）` : '开始转换';
+}
+function showErr(msg) { $('pickErr').hidden = !msg; $('pickErr').textContent = msg; }
+
+$('file').addEventListener('change', e => { addFiles(e.target.files); e.target.value = ''; });
+['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => addFiles(e.dataTransfer.files));
+// 从别处复制的图片也能直接粘贴进来
+document.addEventListener('paste', e => {
+  const imgs = [...(e.clipboardData?.files || [])].filter(f => f.type.startsWith('image/'));
+  if (imgs.length && !$('pick').hidden) addFiles(imgs.map((f, i) => new File([f], f.name && okType(f) ? f.name : `粘贴的图片_${Date.now()}_${i}.png`, { type: f.type })));
+});
+
+// ---------- 画识别框（识别过程和结果页共用） ----------
+const KIND = { text: ['t', '文字'], icon: ['i', '图标'], picture: ['p', '图片'], rejected: ['r', '未抠出'] };
+function addBoxes(stage, kind, list, W, H, imgUrl, pop) {
+  const [cls, label] = KIND[kind];
+  list.forEach(([x, y, w, h, score, info], n) => {
+    const b = document.createElement('div'); b.className = 'box ' + cls + (pop ? ' pop' : '');
+    b.dataset.kind = kind;
+    const tag = document.createElement('b'); tag.className = 'score'; tag.textContent = score; b.append(tag);
+    if (score < 70) b.classList.add('weak');                   // 分数偏低的用虚线，提醒留意
+    b.style.cssText = `left:${x / W * 100}%;top:${y / H * 100}%;width:${w / W * 100}%;height:${h / H * 100}%`;
+    if (pop) b.style.animationDelay = `${Math.min(n * 28, 900)}ms`;
+    b.dataset.tip = kind === 'text' ? `文字 · ${score} 分\n${info || ''}`
+      : kind === 'rejected' ? `未抠出 · ${score} 分（低于 55 分）\n${info || ''}`
+      : `${label} · ${score} 分 · 可单独移动\n${info || ''}`;
+    if (y / H > 0.8) b.classList.add('up');                    // 靠近底部的框，提示改到上方显示
+    if ((kind === 'icon' || kind === 'picture') && imgUrl) {                           // 悬停时显示"抠出来的那一块"
+      const cut = document.createElement('i'); cut.className = 'cut';
+      cut.style.backgroundImage = `url("${imgUrl}")`;
+      cut.style.backgroundSize = `${W / w * 100}% ${H / h * 100}%`;
+      cut.style.backgroundPosition = `${W > w ? x / (W - w) * 100 : 0}% ${H > h ? y / (H - h) * 100 : 0}%`;
+      b.append(cut);
+    }
+    stage.append(b);
+  });
+}
+
+// 识别过程：后端每完成一步，就把那一步找到的框弹出来
+const live = { page: -1, drawn: {}, url: null, w: 0, h: 0 };
+function setLiveImage(i) {
+  if (live.url) URL.revokeObjectURL(live.url);
+  live.page = i; live.drawn = {}; live.url = URL.createObjectURL(files[i]);
+  const st = $('liveStage'); st.querySelectorAll('.box').forEach(b => b.remove());
+  $('liveImg').src = live.url;
+  document.querySelectorAll('#steps li').forEach(li => { li.className = li.className.replace(/ (on|ok)/g, ''); li.querySelector('b').textContent = ''; });
+}
+const ORDER = ['ocr', 'text', 'picture', 'icon', 'erase'];
+function updateLive(lv) {
+  if (!lv) return;
+  if (lv.page !== live.page) setLiveImage(lv.page);
+  const img = $('liveImg'), st = $('liveStage');
+  st.dataset.stage = lv.stage;
+  if (!img.naturalWidth) return;                               // 图片还没加载好，下一轮再画
+  const W = img.naturalWidth, H = img.naturalHeight, at = ORDER.indexOf(lv.stage);
+  for (const kind of ['text', 'picture', 'icon']) {
+    if (at >= ORDER.indexOf(kind) && !live.drawn[kind]) {
+      live.drawn[kind] = true;
+      addBoxes(st, kind, lv[kind] || [], W, H, live.url, true);
+      if (kind === 'icon') addBoxes(st, 'rejected', lv.rejected || [], W, H, live.url, true);
+    }
+  }
+  // 步骤条：正在做的那一步闪烁，做完的显示找到的数量
+  const doing = { ocr: 'text', text: 'picture', picture: 'icon', icon: 'erase', erase: 'erase' }[lv.stage];
+  document.querySelectorAll('#steps li').forEach(li => {
+    const k = li.dataset.k, done = ORDER.indexOf(k) <= at && k !== doing;
+    li.classList.toggle('ok', done); li.classList.toggle('on', k === doing);
+    li.querySelector('b').textContent = done && lv[k] ? lv[k].length : '';
+  });
+}
+
+// ---------- 转换 ----------
+async function api(url, opt) {
+  const r = await fetch(url, opt);
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `请求失败（${r.status}）`);
+  return j;
+}
+$('start').addEventListener('click', async () => {
+  if (!files.length) return;
+  showErr('');
+  $('pick').hidden = true; $('run').hidden = false;
+  const t0 = Date.now();
+  timer = setInterval(() => { $('clock').textContent = `${Math.round((Date.now() - t0) / 1000)} 秒`; }, 500);
+  const total = files.length;
+  try {
+    const q = new URLSearchParams({ icons: $('optIcons').checked ? 1 : 0, pictures: $('optPics').checked ? 1 : 0,
+                                    inpaint: $('optFast').checked ? 'telea' : 'auto' });
+    const { id } = await api('/api/jobs?' + q, { method: 'POST' });
+    setLiveImage(0); $('liveStage').dataset.stage = 'upload';
+    for (let i = 0; i < total; i++) {
+      $('what').textContent = `正在上传第 ${i + 1} / ${total} 张`;
+      $('fill').style.width = `${(i / total) * 8}%`;
+      await api(`/api/jobs/${id}/files?name=${encodeURIComponent(files[i].name)}`, { method: 'POST', body: files[i] });
+    }
+    await api(`/api/jobs/${id}/start`, { method: 'POST' });
+    $('runHint').textContent = $('optFast').checked
+      ? '快速模式下每张图几秒钟。'
+      : '每张图大约 15 到 30 秒，第一张要多等几秒加载模型。';
+    await waitJob(id, total);
+  } catch (err) {
+    $('run').hidden = true; $('pick').hidden = false;
+    showErr(`转换没有完成：${err.message}`);
+  } finally {
+    clearInterval(timer);
+  }
+});
+
+async function waitJob(id, total) {
+  while (true) {
+    const job = await api(`/api/jobs/${id}`);
+    if (job.state === 'error') throw new Error(job.error);
+    if (job.state === 'done') { showResult(job); break; }
+    $('what').textContent = job.state === 'queued' ? '排队中，前面还有一个任务' : `正在转换第 ${Math.min(job.done + 1, total)} / ${total} 张`;
+    const part = job.live ? (ORDER.indexOf(job.live.stage) + 1) / (ORDER.length + 2) : 0;   // 页内进度
+    $('fill').style.width = `${8 + ((job.done + part) / total) * 92}%`;
+    updateLive(job.live);
+    await new Promise(r => setTimeout(r, 350));
+  }
+}
+
+// ---------- 手动调整 ----------
+// 每页一份"想要的元素清单"。src 是自动识别时的框：没动过的元素带着它，后台就原样保留；
+// 动过 / 新画的 src 为空，后台按新的框重新抠；从清单里删掉的不再抠，留在底图里。
+let editors = [];          // 每页一个 { els, rej, dirty, reset }
+let currentJob = null;
+function refreshRedo() {
+  const n = editors.filter(e => e.dirty || e.reset).length;
+  $('redo').hidden = n === 0;
+  $('redo').textContent = n > 1 ? `按修改重新生成（${n} 页）` : '按修改重新生成';
+}
+function makeEditor(p, i, sec, stage) {
+  const ed = { dirty: false, reset: false, sel: null, newKind: 'icon',
+    els: [...p.icon.map(r => ({ box: r.slice(0, 4), kind: 'icon', src: r[6] ? null : r.slice(0, 4) })),
+          ...p.picture.map(r => ({ box: r.slice(0, 4), kind: 'picture', src: r[6] ? null : r.slice(0, 4) }))],
+    rej: p.rejected.map(r => r.slice(0, 4)) };
+  editors[i] = ed;
+  const layer = document.createElement('div'); layer.className = 'edit-layer'; stage.append(layer);
+  const bar = document.createElement('div'); bar.className = 'edit-bar';
+  const mk = (text, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = text; b.onclick = fn; bar.append(b); return b; };
+  const span = t => { const s = document.createElement('span'); s.textContent = t; bar.append(s); return s; };
+  span('画新框：');
+  const bIcon = mk('图标', () => { ed.newKind = 'icon'; draw(); });
+  const bPic = mk('图片', () => { ed.newKind = 'picture'; draw(); });
+  span('　选中的框：');
+  const bDel = mk('删除（留在底图）', () => { if (ed.sel) { ed.els.splice(ed.els.indexOf(ed.sel), 1); ed.sel = null; touch(); } });
+  const bSwap = mk('改成图片', () => { if (ed.sel) { ed.sel.kind = ed.sel.kind === 'icon' ? 'picture' : 'icon'; ed.sel.src = null; touch(); } });
+  span('　');
+  mk('恢复自动识别', () => { ed.reset = true; ed.dirty = false; refreshRedo(); tip.textContent = '这一页会按自动识别的结果重新生成。点上方"按修改重新生成"生效。'; });
+  const tip = document.createElement('span'); tip.className = 'tip'; bar.append(tip);
+  const TIP = '拖动框可以移动，选中后拖四个角改大小；在空白处按住拖动画一个新框；点灰色虚线框把它抠出来。图标框里的文字仍然是文字，图片框里的文字跟着图片走。改完点上方"按修改重新生成"。';
+  tip.textContent = TIP;
+  sec.append(bar);
+  const touch = () => { ed.dirty = true; ed.reset = false; tip.textContent = TIP; refreshRedo(); draw(); };
+  const pct = (b) => `left:${b[0] / p.w * 100}%;top:${b[1] / p.h * 100}%;width:${b[2] / p.w * 100}%;height:${b[3] / p.h * 100}%`;
+  function draw() {
+    layer.innerHTML = '';
+    bIcon.setAttribute('aria-pressed', ed.newKind === 'icon'); bPic.setAttribute('aria-pressed', ed.newKind === 'picture');
+    bDel.disabled = bSwap.disabled = !ed.sel;
+    bSwap.textContent = ed.sel && ed.sel.kind === 'picture' ? '改成图标' : '改成图片';
+    ed.rej.forEach((b, n) => {
+      const d = document.createElement('div'); d.className = 'ebox r'; d.style.cssText = pct(b); d.title = '点一下把它抠出来';
+      d.addEventListener('pointerdown', e => { e.stopPropagation(); const el = { box: b.slice(), kind: 'icon', src: null };
+        ed.rej.splice(n, 1); ed.els.push(el); ed.sel = el; touch(); });
+      layer.append(d);
+    });
+    for (const el of ed.els) {
+      const d = document.createElement('div');
+      d.className = 'ebox ' + (el.kind === 'icon' ? 'i' : 'p') + (el.src ? '' : ' changed') + (el === ed.sel ? ' sel' : '');
+      d.style.cssText = pct(el.box);
+      const lab = document.createElement('b'); lab.className = 'lab'; lab.textContent = (el.kind === 'icon' ? '图标' : '图片') + (el.src ? '' : ' · 手动');
+      d.append(lab);
+      for (const c of ['nw', 'ne', 'sw', 'se']) { const h = document.createElement('i'); h.className = 'h ' + c; h.dataset.c = c; d.append(h); }
+      d.addEventListener('pointerdown', e => { e.stopPropagation(); e.preventDefault(); ed.sel = el; drag(e, el, e.target.dataset.c || 'move'); });
+      layer.append(d);
+    }
+  }
+  // 拖动：move 移动整个框，nw/ne/sw/se 拖一个角，new 画新框
+  function drag(e, el, mode) {
+    const k = p.w / layer.clientWidth, sx = e.clientX, sy = e.clientY, b0 = el.box.slice();
+    let moved = false;
+    draw();
+    const onMove = ev => {
+      const dx = (ev.clientX - sx) * k, dy = (ev.clientY - sy) * k;
+      if (Math.abs(dx) + Math.abs(dy) < 2 && !moved) return;
+      moved = true;
+      let [x, y, w, h] = b0;
+      if (mode === 'move') { x += dx; y += dy; }
+      else if (mode === 'new') { x = dx < 0 ? b0[0] + dx : b0[0]; y = dy < 0 ? b0[1] + dy : b0[1]; w = Math.abs(dx); h = Math.abs(dy); }
+      else {
+        if (mode[1] === 'w') { x += dx; w -= dx; } else w += dx;
+        if (mode[0] === 'n') { y += dy; h -= dy; } else h += dy;
+      }
+      w = Math.max(4, Math.min(w, p.w)); h = Math.max(4, Math.min(h, p.h));
+      x = Math.max(0, Math.min(x, p.w - w)); y = Math.max(0, Math.min(y, p.h - h));
+      el.box = [x, y, w, h].map(Math.round);
+      const d = [...layer.children].find(c => c.classList.contains('sel'));
+      if (d) d.style.cssText = pct(el.box);
+    };
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp);
+      if (mode === 'new' && (el.box[2] < 8 || el.box[3] < 8)) { ed.els.splice(ed.els.indexOf(el), 1); ed.sel = null; draw(); return; }   // 只是点了一下空白：取消选中
+      if (moved || mode === 'new') { el.src = null; touch(); } else draw();
+    };
+    window.addEventListener('pointermove', onMove); window.addEventListener('pointerup', onUp);
+  }
+  layer.addEventListener('pointerdown', e => {
+    if (e.target !== layer) return;
+    e.preventDefault();
+    const r = layer.getBoundingClientRect(), k = p.w / r.width;
+    const el = { box: [Math.round((e.clientX - r.left) * k), Math.round((e.clientY - r.top) * k), 1, 1], kind: ed.newKind, src: null };
+    ed.els.push(el); ed.sel = el; drag(e, el, 'new');
+  });
+  ed.remove = () => { if (ed.sel) bDel.onclick(); };
+  ed.active = () => sec.classList.contains('editing');
+  draw();
+  return ed;
+}
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+  const ed = editors.find(x => x && x.active() && x.sel);
+  if (ed) { e.preventDefault(); ed.remove(); }
+});
+$('redo').addEventListener('click', async () => {
+  const job = currentJob, pages = {};
+  editors.forEach((ed, i) => {
+    if (ed.reset) pages[i] = null;
+    else if (ed.dirty) pages[i] = ed.els.map(el => ({ box: el.box, kind: el.kind === 'picture' ? '图片' : '图标', src: el.src }));
+  });
+  $('result').hidden = true; $('run').hidden = false;
+  $('what').textContent = '正在按你的修改重新生成…'; $('fill').style.width = '8%';
+  $('runHint').textContent = '只重新处理改过的页，文字不用重新识别，会比第一次快。';
+  const t0 = Date.now();
+  timer = setInterval(() => { $('clock').textContent = `${Math.round((Date.now() - t0) / 1000)} 秒`; }, 500);
+  try {
+    await api(`/api/jobs/${job.id}/redo`, { method: 'POST', body: JSON.stringify({ pages }) });
+    await waitJob(job.id, job.pages.length);
+  } catch (err) {
+    $('run').hidden = true; $('result').hidden = false;
+    alertRedo(`重新生成没有完成：${err.message}`);
+  } finally { clearInterval(timer); }
+});
+function alertRedo(msg) {
+  if (msg.includes('没有这个地址')) msg = '重新生成没有完成：后台程序还是旧版本。请点页面最下面的"关闭程序"，再重新打开，然后重新上传图片。';
+  $('sub').textContent = msg; $('sub').style.cssText = 'color:#FFD166;font-weight:600;font-size:14px';
+  window.scrollTo({ top: 0 });
+}
+
+// ---------- 结果 ----------
+function showResult(job) {
+  currentJob = job; editors = [];
+  $('run').hidden = true; $('result').hidden = false;
+  const n = k => job.pages.reduce((s, p) => s + p[k].length, 0);
+  $('sum').textContent = `已转换 ${job.pages.length} 页`;
+  $('sub').textContent = `${n('text')} 个文本框 · ${n('icon')} 个图标 · ${n('picture')} 张图片 · 用时 ${job.seconds} 秒`;
+  $('download').href = `/api/jobs/${job.id}/download`;
+  $('download').textContent = `下载 ${job.download_name}`;
+  const host = $('pages'); host.innerHTML = '';
+  job.pages.forEach((p, i) => {
+    const sec = document.createElement('div'); sec.className = 'page';
+    const stage = document.createElement('div'); stage.className = 'stage';
+    const img = document.createElement('img'); img.src = `/api/jobs/${job.id}/image/${i}/orig`; img.alt = `第 ${i + 1} 页预览`;
+    stage.append(img);
+    const origUrl = `/api/jobs/${job.id}/image/${i}/orig`;
+    for (const k of ['rejected', 'picture', 'icon', 'text']) addBoxes(stage, k, p[k] || [], p.w, p.h, origUrl, true);
+    const head = document.createElement('div'); head.className = 'page-head';
+    const title = document.createElement('div'); title.className = 'title';
+    title.innerHTML = `第 ${i + 1} 页<small></small>`; title.querySelector('small').textContent = `${p.name} · ${p.w}×${p.h}`;
+    const chips = document.createElement('div'); chips.className = 'chips';
+    for (const [k, cls, label] of [['text', 't', '文字'], ['icon', 'i', '图标'], ['picture', 'p', '图片'], ['rejected', 'r', '未抠出']]) {
+      if (!p[k]) p[k] = [];
+      const c = document.createElement('button'); c.className = 'chip ' + cls; c.setAttribute('aria-pressed', 'true');
+      c.innerHTML = `${label} <b>${p[k].length}</b>`;
+      c.onclick = () => { const on = c.getAttribute('aria-pressed') !== 'true'; c.setAttribute('aria-pressed', on); stage.classList.toggle('hide-' + cls, !on); };
+      chips.append(c);
+    }
+    const base = document.createElement('button'); base.className = 'chip base'; base.setAttribute('aria-pressed', 'false'); base.textContent = '看底图';
+    base.title = '把文字和抠走的元素都拿掉之后剩下的背景';
+    base.onclick = () => { const on = base.getAttribute('aria-pressed') !== 'true'; base.setAttribute('aria-pressed', on);
+                           img.src = `/api/jobs/${job.id}/image/${i}/${on ? 'clean' : 'orig'}`; };
+    chips.append(base);
+    const edit = document.createElement('button'); edit.className = 'chip base'; edit.setAttribute('aria-pressed', 'false'); edit.textContent = '手动调整';
+    edit.title = '识别得不对的框，可以自己改大小、删除或补画';
+    edit.onclick = () => { const on = edit.getAttribute('aria-pressed') !== 'true'; edit.setAttribute('aria-pressed', on);
+                           stage.classList.toggle('editing', on); sec.classList.toggle('editing', on); };
+    chips.append(edit);
+    head.append(title, chips);
+    sec.append(head, stage);
+    makeEditor(p, i, sec, stage);
+    if (p.w < 1400) {
+      const note = document.createElement('div'); note.className = 'note';
+      note.textContent = `这张图宽度只有 ${p.w} 像素。小字的粗细和图标边缘会不太准，有更大的原图的话效果会更好。`;
+      sec.append(note);
+    }
+    host.append(sec);
+  });
+  refreshRedo();
+  window.scrollTo({ top: 0 });
+}
+$('again').addEventListener('click', () => {
+  files = []; renderQueue(); $('fill').style.width = '0'; $('clock').textContent = '0 秒';
+  $('result').hidden = true; $('pick').hidden = false;
+});
+document.getElementById('quitApp').addEventListener('click', async (e) => {
+  e.preventDefault();
+  try { await fetch('/api/quit', {method: 'POST'}); } catch (err) {}
+  document.body.innerHTML = '<p style="margin:80px auto;text-align:center;font-size:16px">程序已关闭，可以关掉这个网页了。</p>';
+});
+</script>
+</body>
+</html>
