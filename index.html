@@ -584,6 +584,7 @@ function showResult(job) {
   const n = k => job.pages.reduce((s, p) => s + p[k].length, 0);
   $('sum').textContent = `已转换 ${job.pages.length} 页`;
   $('sub').textContent = `${n('text')} 个文本框 · ${n('icon')} 个图标 · ${n('picture')} 张图片 · 用时 ${job.seconds} 秒`;
+  if (job.warnings && job.warnings.length) { $('sub').textContent += '　⚠ ' + job.warnings.join('；'); $('sub').style.cssText = 'color:#FFD166'; } else { $('sub').style.cssText = ''; }
   $('download').href = `/api/jobs/${job.id}/download`;
   $('download').textContent = `下载 ${job.download_name}`;
   const host = $('pages'); host.innerHTML = '';

@@ -50,6 +50,7 @@ def run_job(job, only=None):
     only：只重新处理这几页（人工调整之后），其余页沿用上次的结果。"""
     with RUN_LOCK:
         job["state"], job["started"], job["done"] = "running", time.time(), 0
+        job["warnings"] = []
         try:
             n = len(job["files"])
             job.setdefault("results", [None] * n)
@@ -67,11 +68,19 @@ def run_job(job, only=None):
                         live["stage"] = name
                     if data is not None:
                         live[name] = data
-                job["results"][i] = core.process_image(
-                    path, "auto", "chi_sim+eng",
-                    with_icons=job["opts"]["icons"], with_pictures=job["opts"]["pictures"],
-                    inpaint=job["opts"]["inpaint"], on_stage=on_stage,
-                    ocr=job["ocr"][i], edits=job["edits"][i])
+                try:
+                    job["results"][i] = core.process_image(
+                        path, "auto", "chi_sim+eng",
+                        with_icons=job["opts"]["icons"], with_pictures=job["opts"]["pictures"],
+                        inpaint=job["opts"]["inpaint"], on_stage=on_stage,
+                        ocr=job["ocr"][i], edits=job["edits"][i])
+                except Exception:
+                    # 抠图那一步碰到没见过的版面出错时，不让整批失败：这一页退回"只转文字"，其余照常
+                    traceback.print_exc()
+                    job["warnings"].append(f"第 {i + 1} 页（{job['names'][i]}）识别图标/图片时出错，这一页只转换了文字")
+                    job["results"][i] = core.process_image(
+                        path, "auto", "chi_sim+eng", with_icons=False, with_pictures=False,
+                        inpaint=job["opts"]["inpaint"], on_stage=on_stage, ocr=job["ocr"][i])
                 job["ocr"][i] = core.process_image.last_ocr      # 文字识别最费时间，留着，人工调整后重新生成时不用再做
                 job["rejected"][i] = list(getattr(core.process_image, "last_rejected", []))
                 job["done"] = i + 1
@@ -123,6 +132,7 @@ def public(job):
     out["total"] = len(job["files"])
     out["names"] = job["names"]
     out["download_name"] = job.get("output_name")
+    out["warnings"] = job.get("warnings", [])
     return out
 
 

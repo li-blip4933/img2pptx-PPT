@@ -1065,7 +1065,7 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
             else:
                 why += " · 淡彩图标"
         elif mi >= n_dark:                                     # 浅色图标：四周得真的是深色底，否则只是浅色背景的一块
-            rh = cv2.cvtColor(np.clip(rpx, 0, 255).astype(np.uint8).reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3)
+            rh = cv2.cvtColor(np.clip(rpx, 0, 255).astype(np.uint8).reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3) if len(rpx) else np.zeros((0, 3))
             darkfrac = float(((rh[:, 2] < 185) | (rh[:, 1] > 95)).mean()) if len(rh) else 0.0
             if darkfrac < 0.7:
                 score, why = min(score, int(40 * darkfrac)), why + " · 四周不是深色底"
