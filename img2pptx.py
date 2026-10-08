@@ -183,6 +183,210 @@ def ocr_rapid(img_bgr):
     return lines
 
 
+# ----------------------------------------------------------------------------
+# 识别复核：补漏字、纠正形近字
+# ----------------------------------------------------------------------------
+WORDS_PATHS = [
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "words.txt"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "words.txt"),
+]
+_WORDS = {}
+
+# 外形很像、识别模型容易认混的字（只收"互相认错了还都是常用字"的组合）
+_CONFUSE = {
+    "目": "自", "自": "目", "己": "已", "已": "己", "未": "末", "末": "未", "土": "士", "士": "土",
+    "入": "人", "人": "入", "曰": "日", "戍": "戌", "戌": "戍", "鹰": "膺", "膺": "鹰", "茶": "荼",
+    "汨": "汩", "汩": "汨", "拨": "拔", "拔": "拨", "候": "侯", "侯": "候", "微": "徽", "徽": "微",
+    "析": "折", "折": "析", "免": "兔", "兔": "免", "治": "冶", "冶": "治", "大": "太", "太": "大",
+    "干": "千", "千": "干", "天": "夭", "夭": "天", "间": "问", "问": "间", "货": "贷", "贷": "货",
+    "裁": "栽", "栽": "裁", "历": "厉", "厉": "历", "壁": "璧", "璧": "壁", "墨": "黑", "仓": "仑",
+}
+
+
+def _words():
+    """常用词表（取自 jieba 词库，MIT 许可）：词 → 词频。找不到文件就返回空表，纠错功能自动关闭。"""
+    if not _WORDS:
+        for path in WORDS_PATHS:
+            if os.path.exists(path):
+                with open(path, encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            _WORDS[parts[0]] = int(parts[1])
+                break
+        if not _WORDS:
+            _WORDS[""] = 0                                     # 标记"已经找过了"
+    return _WORDS
+
+
+def _best_word(text, i):
+    """包含第 i 个字的常用词里，词频最高的那个的词频（没有就是 0）。"""
+    w = _words()
+    best = 0
+    for a in range(max(0, i - 3), i + 1):
+        for b in range(i + 1, min(len(text), a + 4) + 1):
+            if b - a >= 2:
+                best = max(best, w.get(text[a:b], 0))
+    return best
+
+
+def fix_confusables(lines):
+    """形近字纠错：某个字换成和它长得像的字以后能组成常用词，而原来的字跟前后组不成任何词，就换掉。
+    例：原图把"自"画得像"目"，识别成"目我剖析"——"目我"不是词，"自我"是常用词 → 改成"自我剖析"。
+    "项目""目标"里的"目"本来就能组成词，不会动。返回改了几处。"""
+    w = _words()
+    if len(w) < 1000:
+        return 0
+    n = 0
+    for ln in lines:
+        t = list(ln.text)
+        for i, c in enumerate(t):
+            alt = _CONFUSE.get(c)
+            if not alt:
+                continue
+            s = "".join(t)
+            if _best_word(s, i) > 0:
+                continue                                       # 原来的字能组成词：不动
+            s2 = s[:i] + alt + s[i + 1:]
+            if _best_word(s2, i) >= 50:
+                t[i] = alt
+                n += 1
+        new = "".join(t)
+        if new != ln.text:
+            ln.text = new                                      # 字数不变，逐字位置仍然有效
+    return n
+
+
+def _shear(crop, k):
+    """把往右倾斜的字（斜体）扶正：每一行像素按高度往左挪。"""
+    h = crop.shape[0]
+    pad = int(k * h) + 2
+    c2 = cv2.copyMakeBorder(crop, 0, 0, pad, pad, cv2.BORDER_REPLICATE)
+    M = np.float32([[1, k, -k * h / 2.0], [0, 1, 0]])
+    return cv2.warpAffine(c2, M, (c2.shape[1], h), borderMode=cv2.BORDER_REPLICATE)
+
+
+def _is_subseq(short, long_):
+    it = iter(long_)
+    return all(c in it for c in short)
+
+
+def reverify_lines(img_bgr, lines):
+    """识别复核（只用识别模型，不重新找文字位置）。每行换几种"看法"再认一遍：
+      · 原样、斜体扶正两种角度——斜体小字里笔画多的字（"挺膺担当"的"膺"）第一遍常被漏掉
+      · 往右多带一段——字距拉得很开时，行尾最后一个字（"知行合一"的"一"）常被切在框外
+    只接受"在原文基础上补了 1–2 个汉字 / 字母数字"的结果，并且至少两种看法给出同一个答案，避免凭空多出字。
+    返回补字的行数。"""
+    eng = getattr(ocr_rapid, "engine", None)
+    if eng is None:
+        return 0
+    H, W = img_bgr.shape[:2]
+
+    def rec(c):
+        try:
+            r, _ = eng(c, use_det=False, use_cls=False, use_rec=True)
+        except Exception:
+            return None
+        if not r:
+            return None
+        t = str(r[0][0]).strip().replace("　", "")
+        return t, float(r[0][1])
+
+    n = 0
+    for ln in lines:
+        t0 = ln.text
+        h = ln.h
+        if len(t0) < 2 or h < 10 or not any("一" <= c <= "鿿" for c in t0):
+            continue
+        pad = max(2, int(0.25 * h))
+        y0, y1 = max(0, ln.y - pad), min(H, ln.y + h + pad)
+        x0, x1 = max(0, ln.x - pad), min(W, ln.x + ln.w + pad)
+        base = img_bgr[y0:y1, x0:x1]
+        if base.size == 0:
+            continue
+        views = [("原样", base), ("扶正0.22", _shear(base, 0.22)), ("扶正0.30", _shear(base, 0.30))]
+        # 右边紧挨着还有墨迹（和背景明显不同的像素）时，多带一段再认
+        ext_right = None
+        xa, xb = min(W, ln.x + ln.w + 2), min(W, ln.x + ln.w + int(1.6 * h))
+        if xb - xa > 4:
+            strip = img_bgr[ln.y:ln.y + h, xa:xb].astype(np.float32)
+            bgc = np.median(base.reshape(-1, 3).astype(np.float32), axis=0)
+            if (np.linalg.norm(strip - bgc, axis=2) > 60).sum() >= max(4, 0.01 * strip.shape[0] * strip.shape[1]):
+                ext_right = xb
+                for extra in (int(1.0 * h), int(1.6 * h)):
+                    xe = min(W, ln.x + ln.w + extra)
+                    views.append(("右延%d" % extra, img_bgr[y0:y1, x0:xe]))
+        votes = {}
+        for name, v in views:
+            for sc in (1, 2):
+                r = rec(cv2.resize(v, None, fx=sc, fy=sc, interpolation=cv2.INTER_CUBIC) if sc > 1 else v)
+                if not r or r[1] < 0.85:
+                    continue
+                cand = r[0]
+                if cand == t0 or not _is_subseq(t0, cand):
+                    continue
+                extra_chars = [c for c in cand]
+                for c in t0:
+                    extra_chars.remove(c)
+                if not 1 <= len(extra_chars) <= 2 or not all(("一" <= c <= "鿿") or c.isalnum() for c in extra_chars):
+                    continue
+                votes.setdefault(cand, []).append((name, r[1]))
+        if not votes:
+            continue
+        cand, got = max(votes.items(), key=lambda kv: (len(kv[1]), sum(s for _, s in kv[1])))
+        if len(got) < 2:
+            continue
+        # 补在哪里：行首不补（行首多出来的多半是破折号、竖条）；行尾补的字要经得起墨迹检查；中间补的要有空位
+        k = 0
+        while k < len(t0) and cand[k] == t0[k]:
+            k += 1
+        if k == 0:
+            continue
+        added = cand[k:len(cand) - (len(t0) - k)] if len(t0) > k else cand[k:]
+        if cand.startswith(t0):                                # 行尾补字
+            if len(added) != 1 or added in "丨|1lI" or ext_right is None:
+                continue
+            # 右边那块墨迹得像一个字：和这行字同色、离得不比字距远、宽不超过一个字、没有被截断（长横线是装饰线）
+            strip = img_bgr[ln.y:ln.y + h, ln.x + ln.w:min(W, ln.x + ln.w + int(2.2 * h))].astype(np.float32)
+            bgc = np.median(base.reshape(-1, 3).astype(np.float32), axis=0)
+            dist = np.linalg.norm(base.astype(np.float32) - bgc, axis=2)
+            tc = np.median(base[dist >= np.percentile(dist, 97)].reshape(-1, 3).astype(np.float32), axis=0)
+            contrast = float(np.linalg.norm(tc - bgc))
+            if contrast < 40:
+                continue
+            ink = (np.linalg.norm(strip - bgc, axis=2) > 0.25 * contrast).any(axis=0)
+            cols = np.where(ink)[0]
+            if not len(cols):
+                continue
+            st = int(cols[0])
+            en = st
+            for c_ in cols:
+                if c_ - en > 0.5 * h:
+                    break
+                en = int(c_)
+            gaps = [b[0] - a[1] for a, b in zip(ln.chars[:-1], ln.chars[1:])] if ln.chars and len(ln.chars) > 1 else []
+            allow = max(0.8 * h, 1.4 * float(np.median(gaps))) if gaps else 0.8 * h
+            if os.environ.get('REVDBG'):
+                print('   REV', t0, '->', cand, 'st', st, 'en', en, 'allow', round(allow, 1), 'w', strip.shape[1], 'h', h, got)
+            inside_box = st <= 0.3 * h and any(not nm.startswith("右延") for nm, _ in got)   # 字的前半截已经在原来的框里
+            min_w = 2 if inside_box else 0.25 * h
+            if st > allow or not min_w <= en - st <= 1.2 * h or en >= strip.shape[1] - 2:
+                continue
+            new_w = ln.w + en + 1
+        else:                                                  # 行中间补字：要三种以上看法一致，且原来那里确实空着一个字的位置
+            if len(got) < 3:
+                continue
+            if ln.chars and len(ln.chars) == len(t0) and 0 < k < len(t0):
+                if ln.chars[k][0] - ln.chars[k - 1][1] < 0.5 * h:
+                    continue
+            new_w = ln.w
+        ln.text = cand
+        ln.w = int(new_w)
+        ln.chars = None                                        # 字数变了，原来的逐字位置作废
+        n += 1
+    return n
+
+
 def ocr_tesseract(img_bgr, lang):
     """备用方案：调用 tesseract 命令行，用它自带的"行"分组，再按大间距拆栏。"""
     H, W = img_bgr.shape[:2]
@@ -3487,7 +3691,14 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
         lines, used = copy.deepcopy(ocr), "沿用上次的文字识别"
     else:
         lines, used = run_ocr(img, engine, lang)
+        if used == "rapidocr":
+            n_fix = reverify_lines(img, lines)                 # 复核：每行换几种看法再认一遍，补回漏掉的字
+            if n_fix:
+                used += f"（复核补字 {n_fix} 行）"
     process_image.last_ocr = copy.deepcopy(lines)
+    n_conf = fix_confusables(lines)                            # 形近字纠错（"目我剖析"→"自我剖析"）
+    if n_conf:
+        used += f"（形近字纠正 {n_conf} 处）"
     lines = _clean_lines(lines, W)
     strip_side_bars(img, lines)
     lines = split_wide_gaps(img, lines)
