@@ -43,7 +43,8 @@ SLIDE_W_EMU = 12192000          # 13.333 英寸，标准 16:9 宽度
 EMU_PER_PT = 12700
 LINE_SPACING = 1.2              # 文本框行距 = 字号 × 1.2（固定值，便于精确定位）
 BASELINE_RATIO = 0.8            # 固定行距下，基线大约在行顶往下 0.8 × 行距处
-BOLD_MIN_PX = 24                # 字高小于这个像素数时不判断粗细
+BOLD_MIN_PX = 24                # 宋体：字高小于这个像素数时不重新判断粗细（和宋体参考比，小字误差大）
+BOLD_MIN_PX_SANS = 16           # 黑体：参考字体就是 PPT 里的微软雅黑，16 像素以上量得准
 ICON_MIN_RATIO = 0.011          # 图标最小边长 = 图宽 × 这个比例（按最小单元找，小箭头也算）
 ICON_KEEP_SCORE = 55            # 图标置信分达到这个数才抠出来
 ICON_MAX_RATIO = 0.12           # 图标最大边长 = 图宽 × 这个比例（更大的当作背景装饰）
@@ -78,6 +79,9 @@ class Line:
     fit: float = 0.0            # 字距修正（相对字号的比例）：原图的字比参考字体窄 / 宽多少
     chars: list = None          # 每个字的横向范围 [(x0, x1)]，OCR 能提供时才有
     own_mask: tuple = None
+    run_strokes: list = None
+    heavy_runs: set = None
+    heavy: bool = False         # 比华文中宋还粗（大标题）：PPT 里在华文中宋上再加粗
     stroke: float = 0.0
     runs: list = None           # 一行内按颜色拆开的片段 [(文字, 颜色, 是否加粗, 字号像素)]
 
@@ -91,9 +95,14 @@ class Block:
 # ----------------------------------------------------------------------------
 # 参考字体：只用来"量尺寸"，不是最终 PPT 里的字体
 # ----------------------------------------------------------------------------
+_OFFICE = "/Applications/Microsoft PowerPoint.app/Contents/Resources/DFonts/"   # Mac 版 Office 自带的字体
+_TESTF = "/mnt/user-data/uploads/Developer/img2ppt/debug/fonts/"                 # 开发时的测试字体（不随程序发布）
+# 参考字体优先用"PPT 里真正会用的字体"（微软雅黑 / 宋体 / 华文中宋），这样量出来的字宽和 PowerPoint 里显示的一致
 _FONT_CANDIDATES = {
     False: [
         "C:/Windows/Fonts/msyh.ttc",
+        _OFFICE + "msyh.ttc",
+        _TESTF + "msyh.ttc",
         "/System/Library/Fonts/PingFang.ttc",
         ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),       # macOS：冬青黑体 W3
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -101,6 +110,8 @@ _FONT_CANDIDATES = {
     ],
     True: [
         "C:/Windows/Fonts/msyhbd.ttc",
+        _OFFICE + "msyhbd.ttc",
+        _TESTF + "msyhbd.ttc",
         ("/System/Library/Fonts/Hiragino Sans GB.ttc", 2),       # macOS：冬青黑体 W6
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
@@ -110,16 +121,20 @@ _FONT_CANDIDATES = {
 _SERIF_CANDIDATES = {
     False: [
         "C:/Windows/Fonts/simsun.ttc",
+        _OFFICE + "Simsun.ttc",
+        _TESTF + "Simsun.ttc",
         ("/System/Library/Fonts/Supplemental/Songti.ttc", 6),      # macOS：宋体-简 常规
         ("/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc", 2),
     ],
-    True: [
-        "C:/Windows/Fonts/simsun.ttc",
+    True: [                                                    # 宋体没有粗体；粗宋体用华文中宋（Office 自带）
+        "C:/Windows/Fonts/STZHONGS.TTF",
+        _OFFICE + "STZHONGS.ttf",
+        _TESTF + "STZHONGS.ttf",
         ("/System/Library/Fonts/Supplemental/Songti.ttc", 1),      # macOS：宋体-简 粗体
         ("/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc", 2),
     ],
 }
-PPT_FONTS = {"sans": "Microsoft YaHei", "serif": "SimSun"}     # PPT 里写的字体名：Windows、Mac 版 Office 都自带
+PPT_FONTS = {"sans": "Microsoft YaHei", "serif": "SimSun", "serif_bold": "STZhongsong"}     # PPT 里写的字体名：Windows、Mac 版 Office 都自带
 _font_cache = {}
 
 
@@ -347,7 +362,9 @@ def analyze_line(img_bgr, ln, full_mask):
         ImageDraw.Draw(tmp).text((4 - bb[0], 4 - bb[1]), ln.text, font=fb, fill=255, anchor="ls")
         ref[bold] = _stroke_width(np.asarray(tmp) > 127) * scale
     ln.bold = sw > ref[False] ** 0.4 * ref[True] ** 0.6       # 阈值略偏向粗体一侧，减少误判
-    if ln.size_px < BOLD_MIN_PX and not ln.badge:             # 字太小时笔画只有 1 像素左右，量不准，一律按常规体
+    if ln.size_px < BOLD_MIN_PX:                              # 小字（16–24 像素）：门槛更偏向粗体，免得把稍重的正文判成粗体
+        ln.bold = sw > ref[False] ** 0.25 * ref[True] ** 0.75
+    if ln.size_px < BOLD_MIN_PX_SANS and not ln.badge:        # 字太小时笔画只有 1 像素左右，量不准，一律按常规体
         ln.bold = False                                       # （序号的字笔画粗、背景干净，可以量）
 
     # 一行里有两种颜色（比如重点词标成别的颜色）时，拆成几段分别上色
@@ -370,18 +387,46 @@ def _split_runs(ln, roi, ink, solid, dist, x0, scale, bg):
     if len(ln.text) < 2 or len(px) < 40:
         return whole
     crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
-    _, lab, cen = cv2.kmeans(px.astype(np.float32), 2, None, crit, 3, cv2.KMEANS_PP_CENTERS)
-    share = np.bincount(lab.ravel(), minlength=2) / float(len(px))
-    if np.linalg.norm(cen[0] - cen[1]) < 45 or share.min() < 0.10:
-        return whole                                           # 两类颜色太接近，或者其中一类太少：当作单色
-    # 笔画边缘的抗锯齿像素是"文字色和背景色的混合"，会聚成一个假的浅色类。
-    # 真正的第二种颜色不在"背景色 → 文字色"这条连线上，据此区分。
-    v = [cen[0] - bg, cen[1] - bg]
-    far = int(np.linalg.norm(v[1]) > np.linalg.norm(v[0]))
-    axis = v[far] / (np.linalg.norm(v[far]) + 1e-6)
-    near = v[1 - far]
-    if np.linalg.norm(near - np.dot(near, axis) * axis) < 30:     # 黑字里的深绿重点词，偏离只有四五十，门槛不能太高
+    min_share = 0.03 if (ln.chars and len(ln.chars) == len(ln.text)) else 0.10   # 有逐字位置时，行首两三个字的另一种颜色（"反思："）也能分出来
+
+    def off_axis(c0, c1):
+        # 笔画边缘的抗锯齿像素是"文字色和背景色的混合"，会聚成一个假的浅色类。
+        # 真正的第二种颜色不在"背景色 → 文字色"这条连线上，据此区分
+        v = [c0 - bg, c1 - bg]
+        far = int(np.linalg.norm(v[1]) > np.linalg.norm(v[0]))
+        axis = v[far] / (np.linalg.norm(v[far]) + 1e-6)
+        near = v[1 - far]
+        return float(np.linalg.norm(near - np.dot(near, axis) * axis))
+
+    def two_colors():
+        pxf = px.astype(np.float32)
+        _, lab2, cen2 = cv2.kmeans(pxf, 2, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+        sh = np.bincount(lab2.ravel(), minlength=2) / float(len(px))
+        if np.linalg.norm(cen2[0] - cen2[1]) >= 45 and sh.min() >= min_share and off_axis(cen2[0], cen2[1]) >= 30:
+            return lab2.ravel(), cen2, sh                      # 黑字里的深绿重点词，偏离只有四五十，门槛不能太高
+        # 另一种颜色只占几个字时，两类聚出来的是"笔画芯 / 抗锯齿边"。分三类，挑偏离最远的一对
+        if len(px) < 60:
+            return None
+        _, lab3, cen3 = cv2.kmeans(pxf, 3, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+        best = None
+        for i in range(3):
+            for j in range(i + 1, 3):
+                o = off_axis(cen3[i], cen3[j])
+                if np.linalg.norm(cen3[i] - cen3[j]) >= 45 and (best is None or o > best[0]):
+                    best = (o, i, j)
+        if best is None or best[0] < 40:
+            return None
+        c2 = np.stack([cen3[best[1]], cen3[best[2]]])
+        lab = np.argmin(np.linalg.norm(pxf[:, None, :] - c2[None], axis=2), axis=1)
+        sh = np.bincount(lab, minlength=2) / float(len(px))
+        if sh.min() < min_share:
+            return None
+        return lab, c2, sh
+
+    got = two_colors()
+    if got is None:
         return whole
+    lab, cen, share = got
 
     labmap = np.full(ink.shape, -1, np.int8)
     labmap[strong] = lab.ravel()
@@ -477,15 +522,20 @@ def _split_runs(ln, roi, ink, solid, dist, x0, scale, bg):
                 pieces.append((start, i, a, b, char_lab[start]))
                 start = i
 
-    runs = []
+    runs, strokes = [], []
     for c0, c1, a, b, k_ in pieces:
         seg = ln.text[c0:c1]
         b_, g_, r_ = cen[k_]
+        sub_lab = labmap[:, a:max(b, a + 1)]
+        sub_px = roi[:, a:max(b, a + 1)][sub_lab == k_]
+        if len(sub_px) >= 10:                                  # 这一段自己的颜色：取离背景最远的那部分像素（聚类中心混了抗锯齿边，偏浅）
+            dd = np.linalg.norm(sub_px - bg, axis=1)
+            b_, g_, r_ = np.median(sub_px[dd >= np.percentile(dd, 80)], axis=0)
         size = 200.0 * ink_h(a, b) / ref_h(seg) if per_piece_size and ink_h(a, b) else ln.size_px
         if not 0.6 * ln.size_px <= size <= 1.6 * ln.size_px:
             size = ln.size_px
         bold = ln.bold
-        if size >= BOLD_MIN_PX and b - a > 4:                  # 每段单独判断粗细（"重点词加粗"很常见）
+        if size >= BOLD_MIN_PX_SANS and b - a > 4:             # 每段单独判断粗细（"重点词加粗"很常见）
             sw = _stroke_width(solid[:, a:b])
             rw = {}
             for bd in (False, True):
@@ -497,6 +547,8 @@ def _split_runs(ln, roi, ink, solid, dist, x0, scale, bg):
             if rw[False] > 0 and rw[True] > 0:
                 bold = sw > rw[False] ** 0.4 * rw[True] ** 0.6
         runs.append((seg, (int(r_), int(g_), int(b_)), bool(bold), float(size)))
+        strokes.append(_stroke_width(solid[:, a:b]) if b - a > 4 else 0.0)
+    ln.run_strokes = strokes
     return runs
 
 
@@ -537,7 +589,7 @@ def refit_widths(lines):
                 width += ref_font(200, bold, ln.family).getlength(seg) * px / 200.0
         n = max(1, len(ln.text))
         need = (target - width) / n / ln.size_px
-        ln.fit = float(np.clip(need, -0.06, 0.01 if lead else (1.6 if need > 0.25 else 0.03)))   # 明显拉开字距排的字（"学 思 践 悟"）照原样拉开
+        ln.fit = float(np.clip(need, -0.06, 0.01 if lead else (1.6 if need > 0.1 else 0.03)))   # 明显拉开字距排的字（"学 思 践 悟"）照原样拉开
         if need < -0.06:
             # 原图用的是更窄的字体。字距收到 6% 已经是极限（再收字就叠在一起了），剩下的差距靠把字号调小一点补上
             k = float(np.clip(target / (width + ln.fit * n * ln.size_px), 0.86, 1.0))
@@ -603,6 +655,33 @@ def _stroke_contrast(ink):
     return float(np.median(v)) / max(1.0, float(np.median(h)))
 
 
+def _stroke_contrast_cov(img_bgr, ln):
+    """小字用的横竖笔画比：按"像素有多接近文字色"取覆盖率（带抗锯齿的小数），放大 6 倍再量，比二值笔画准。"""
+    x0, y0, x1, y1 = ln.ink
+    roi = img_bgr[y0:y1, x0:x1].astype(np.float32)
+    if roi.shape[0] < 8 or roi.shape[1] < 8:
+        return None
+    col = np.array(ln.color[::-1], np.float32)
+    bg = np.median(np.concatenate([roi[0], roi[-1], roi[:, 0], roi[:, -1]]), axis=0)
+    span = float(np.linalg.norm(col - bg))
+    if span < 40:
+        return None
+    cov = np.clip(((roi - bg) @ ((col - bg) / span)) / span, 0, 1)
+    big = cv2.resize(cov, None, fx=6, fy=6, interpolation=cv2.INTER_CUBIC) > 0.5
+    def run_lengths(a):
+        out = []
+        for row in a:
+            d = np.diff(np.concatenate([[0], row.astype(np.int8), [0]]))
+            out.append(np.where(d == -1)[0] - np.where(d == 1)[0])
+        return np.concatenate(out) if out else np.zeros(0)
+    lim = 0.25 * big.shape[0]
+    v, h = run_lengths(big.T), run_lengths(big)
+    v, h = v[v < lim], h[h < lim]
+    if len(v) < 20 or len(h) < 20:
+        return None
+    return float(np.median(v)) / max(1.0, float(np.median(h)))
+
+
 def audit_lines(img_bgr, lines, full_mask):
     """审核：每一行文字都按"黑体 / 宋体 × 常规 / 加粗"回渲染，和原图里这行字的笔画逐像素比对。
       · 哪种字体吻合度高，这一行在 PPT 里就用哪种（整页先投票定基调，差别明显的行才单独换）
@@ -662,18 +741,52 @@ def audit_lines(img_bgr, lines, full_mask):
                     best[fam] = max(best.get(fam, 0.0), v)
                 fit = max(fit, v)
         best["fit"] = fit
-        best["contrast"] = _stroke_contrast(inks[0]) if ln.size_px >= 28 else None    # 小字笔画只有一两个像素，量不出横竖差别
+        ln.fam_iou = (best.get("sans", 0.0), best.get("serif", 0.0))
+        best["contrast"] = _stroke_contrast(inks[0]) if ln.size_px >= 28 else None    # 小字笔画只有一两个像素，二值图量不出横竖差别
+        best["contrast_s"] = _stroke_contrast_cov(img_bgr, ln) if 12 <= ln.size_px < 28 else None
         scores.append(best)
     # 整页投票：同一页通常只用一两种字体，单行比对有误差，先看大多数
     # 宋体 / 黑体按"横竖笔画粗细比"判断；整页先投票定基调
     vote = sum((0.7 - s["contrast"]) * len(ln.text) for s, ln in zip(scores, lines) if s and s.get("contrast") is not None)
     page = "serif" if vote > 0 else "sans"
+    # 小字（正文）单独定基调：标题常用宋体、正文常用黑体，不能跟着标题走。
+    # 小字量出来的比值误差大，取这一页所有中文小字的中位数（黑体约 0.85–1.05；思源宋体这类小字约 0.65–0.75）
+    cs = [s["contrast_s"] for s, ln in zip(scores, lines)
+          if s and s.get("contrast_s") is not None and any("\u4e00" <= ch <= "\u9fff" for ch in ln.text)]
+    page_small = ("serif" if float(np.median(cs)) < 0.78 else "sans") if len(cs) >= 2 else page
+    page_cs = float(np.median(cs)) if cs else None
+    # 同一段（左对齐、字号相近、上下相邻的几行）字体一样：取这一段的中位数，再和整页的中位数各占一半
+    small = [(ln, s["contrast_s"]) for s, ln in zip(scores, lines)
+             if s and s.get("contrast_s") is not None and ln.size_px < 28 and ln.ink]
+    small.sort(key=lambda p: p[0].y)
+    grp_val = {}
+    used = set()
+    for i, (a, ca) in enumerate(small):
+        if id(a) in used:
+            continue
+        grp = [(a, ca)]
+        for b, cb in small[i + 1:]:
+            last = grp[-1][0]
+            if id(b) not in used and abs(b.ink[0] - last.ink[0]) < 0.8 * last.size_px \
+                    and abs(b.size_px - last.size_px) < 0.15 * last.size_px and 0 < b.y - last.y < 2.2 * last.size_px:
+                grp.append((b, cb))
+        for g, _ in grp:
+            used.add(id(g))
+        v = float(np.median([c for _, c in grp]))
+        if page_cs is not None:
+            v = 0.5 * v + 0.5 * page_cs
+        for g, _ in grp:
+            grp_val[id(g)] = v
     dropped = []
     for s, ln in zip(scores, lines):
         if not s:
             continue
         c = s.get("contrast")
         ln.family = "serif" if c is not None and c <= 0.55 else "sans" if c is not None and c >= 0.85 else page
+        cs_ = s.get("contrast_s")
+        if ln.size_px < 28 and any("\u4e00" <= ch <= "\u9fff" for ch in ln.text):
+            gv = grp_val.get(id(ln))
+            ln.family = ("serif" if gv <= 0.78 else "sans") if gv is not None else page_small
         if ln.text.isascii():
             ln.family = page                                   # 数字、字母没有"横细竖粗"可量，跟整页走
         ln.audit = s["fit"]
@@ -682,6 +795,22 @@ def audit_lines(img_bgr, lines, full_mask):
             print("   audit %-5s fit %.2f contrast %s  %s" % (ln.family, s["fit"], "%.2f" % s["contrast"] if s.get("contrast") is not None else " -- ", ln.text[:16]))
         if ln.audit < 0.36 and ln.size_px >= 40 and len(ln.text) >= 2:
             dropped.append(ln)
+    # 同字号、同颜色的一批小字（并列的卡片、列表）字体统一：明显的少数派改成多数派
+    smalls = [ln for ln in lines if ln.ink and ln.size_px < 28 and getattr(ln, "family", None) and not ln.text.isascii()]
+    for _ in range(2):                                         # 先统一算、再一起改，结果和行的顺序无关；做两轮让多数派稳定
+        new_fam = {}
+        for a in smalls:
+            peers = [b for b in smalls if abs(b.size_px - a.size_px) < 0.06 * a.size_px and _color_close(a.color, b.color)]
+            if len(peers) < 3:
+                continue
+            n_serif = sum(len(b.text) for b in peers if b.family == "serif")
+            n_all = sum(len(b.text) for b in peers)
+            if a.family == "serif" and n_serif < 0.45 * n_all:
+                new_fam[id(a)] = "sans"
+            elif a.family == "sans" and n_serif > 0.55 * n_all:
+                new_fam[id(a)] = "serif"
+        for a in smalls:
+            a.family = new_fam.get(id(a), a.family)
     for ln in dropped:                                         # 不抹掉：这行字原样留在底图里（只撤掉它自己的掩膜）
         if ln.own_mask is None:
             continue
@@ -693,8 +822,166 @@ def audit_lines(img_bgr, lines, full_mask):
         mx, my, m = ln.own_mask
         sub = full_mask[my:my + m.shape[0], mx:mx + m.shape[1]]
         sub[...] = np.maximum(sub, m[:sub.shape[0], :sub.shape[1]])
-    # 粗细仍按黑体参考字体量出来的结果：各电脑上的宋体粗细差别很大（Mac 的宋体比原图细得多），用它判断会把常规字都判成粗体
+    # 宋体行重新判断粗细：和"宋体常规"、"华文中宋"（PPT 里粗宋体用的字体）在同一字号下的笔画宽度比较。
+    # 参考字体就是 PPT 里真正用的字体，所以判断结果和 PowerPoint 里显示的一致；还特别粗的（标题），在华文中宋上再加粗
+    def serif_ref(text, px):
+        rw = []
+        for bold in (False, True):
+            fb = ref_font(200, bold, "serif")
+            bb = fb.getbbox(text, anchor="ls")
+            tmp = Image.new("L", (max(1, bb[2] - bb[0]) + 8, max(1, bb[3] - bb[1]) + 8), 0)
+            ImageDraw.Draw(tmp).text((4 - bb[0], 4 - bb[1]), text, font=fb, fill=255, anchor="ls")
+            rw.append(_stroke_width(np.asarray(tmp) > 127) * px / 200.0)
+        return rw
+    for ln in lines:
+        if ln in dropped or ln.family != "serif" or ln.stroke <= 0:
+            continue
+        multi = ln.runs and len(ln.runs) > 1 and ln.run_strokes and len(ln.run_strokes) == len(ln.runs)
+        if multi:
+            # 多色行（正文里夹着红色加粗的"一等奖"）：以最长那段为基准，基准段只用它自己的笔画判断粗细；
+            # 别的段和它相比：明显更粗（≥1.25 倍）的是加粗的重点词——基准已经是华文中宋时，重点词再勾上"加粗"
+            lens = [len(t.strip()) for t, c, b, px in ln.runs]
+            k0 = int(np.argmax(lens))
+            base = ln.run_strokes[k0]
+            if ln.size_px >= BOLD_MIN_PX and base > 0:
+                rw = serif_ref(ln.runs[k0][0], ln.runs[k0][3])
+                if rw[0] > 0 and rw[1] > 0:
+                    ln.bold = base > (rw[0] * rw[1]) ** 0.5
+            nr, heavy = [], set()
+            for k, ((t, c, b, px), sw) in enumerate(zip(ln.runs, ln.run_strokes)):
+                if k == k0:
+                    b = ln.bold
+                elif base > 0 and sw > 0:
+                    if sw >= 1.25 * base:
+                        b = True
+                        if ln.bold:
+                            heavy.add(k)
+                    else:
+                        b = ln.bold
+                nr.append((t, c, b, px))
+            ln.runs, ln.heavy_runs = nr, heavy
+            continue
+        if ln.size_px < BOLD_MIN_PX:
+            continue
+        rw = serif_ref(ln.text, ln.size_px)
+        if rw[0] <= 0 or rw[1] <= 0:
+            continue
+        ln.bold = ln.stroke > (rw[0] * rw[1]) ** 0.5
+        ln.heavy = ln.bold and ln.stroke > 1.3 * rw[1]
+        if ln.runs:
+            ln.runs = [(t, c, ln.bold, px) for t, c, b, px in ln.runs]
     return dropped
+
+
+_PUNCT_L = "，。、；：！？,.;:!?）)”’》」』】…—丨|·"
+_PUNCT_R = "（(“‘《「『【丨|·"
+
+
+_SB = {}
+
+
+def _side_bearings(c):
+    """字 c 在参考字体里左右两边天生空出多少（占一个字宽的比例）。"一""二""三"两边空得多，不能当成空格。"""
+    if c not in _SB:
+        f = ref_font(200)
+        adv = f.getlength(c)
+        bb = f.getbbox(c)
+        _SB[c] = (max(0.0, bb[0]) / 200.0, max(0.0, adv - bb[2]) / 200.0) if adv > 0 and bb[2] > bb[0] else (0.0, 0.0)
+    return _SB[c]
+
+
+def _side_color_diff(roi, ink, ln, i):
+    """第 i 个字和第 i+1 个字的笔画颜色差多少（各取左边、右边紧挨着的两个字）。"""
+    def col(a, b):
+        xa, xb = max(0, ln.chars[a][0] - ln.x), max(0, ln.chars[b][1] - ln.x)
+        px = roi[:, xa:xb][ink[:, xa:xb]]
+        if len(px) < 10:
+            return None
+        return np.median(px, axis=0)
+    l = col(max(0, i - 1), i)
+    r = col(i + 1, min(len(ln.chars) - 1, i + 2))
+    if l is None or r is None:
+        return 0.0
+    return float(np.linalg.norm(l - r))
+
+
+def split_wide_gaps(img_bgr, lines):
+    """识别常把隔着一段空白的两部分并成一行（"05  经百战"、"校级选拔赛  一等奖"）。
+    按实际笔画找行内的空白：特别宽的（≥ 0.9 个字）拆成两行，各自定颜色、字体、斜体；
+    中等宽的（≥ 0.45 个字）在那里补一个空格。标点前后本来就空，不算。返回新的行列表。"""
+    out = []
+    for ln in lines:
+        if not ln.chars or len(ln.chars) != len(ln.text) or len(ln.text) < 2:
+            out.append(ln)
+            continue
+        roi = img_bgr[ln.y:ln.y + ln.h, ln.x:ln.x + ln.w].astype(np.float32)
+        if roi.size == 0:
+            out.append(ln)
+            continue
+        bg = np.median(np.concatenate([roi[0], roi[-1], roi[:, 0], roi[:, -1]]), axis=0)
+        d = np.linalg.norm(roi - bg, axis=2)
+        ink = d > max(30.0, 0.15 * float(np.percentile(d, 99)))   # 浅色的字（粉色"05"）和细横笔画（"一""二"）两头颜色浅，门槛放低
+        colhas = ink.any(axis=0)                               # "一"只是一条细横线，一行像素也算
+        cw = [b - a for (a, b), c in zip(ln.chars, ln.text) if "\u4e00" <= c <= "\u9fff" and b > a]
+        fs = min(0.8 * ln.h, float(np.median(cw))) if len(cw) >= 3 else 0.8 * ln.h   # 字号的粗略估计（行里混着大字时，行高会偏大）
+        # 每两个相邻字之间：从左字的最后一列笔画到右字的第一列笔画，空了多宽。
+        # 识别给的字框不一定准（拉开字距的行常被均分），所以从两字交界处向两边找，直到碰到笔画为止
+        lim = int(1.5 * fs)
+        gaps = []
+        for i in range(len(ln.text) - 1):
+            a, b = ln.chars[i][1] - ln.x, ln.chars[i + 1][0] - ln.x
+            mid = min(ln.w - 1, max(0, (a + b) // 2))
+            if not colhas[mid]:
+                l = mid
+                while l > 0 and not colhas[l - 1] and mid - l < lim:
+                    l -= 1
+                r = mid
+                while r < ln.w - 1 and not colhas[r + 1] and r - mid < lim:
+                    r += 1
+                gaps.append(float(r - l + 1))
+                continue
+            lo, hi = max(0, min(a, b) - int(0.5 * fs)), min(ln.w, max(a, b) + int(0.5 * fs))
+            best = run = 0
+            for v in colhas[lo:hi]:
+                run = 0 if v else run + 1
+                best = max(best, run)
+            gaps.append(best)
+        # 减去两个字天生的留白（"第二"之间看着空，是"二"字本身两边窄）
+        gaps = [max(0.0, g - fs * (_side_bearings(ln.text[i])[1] + _side_bearings(ln.text[i + 1])[0])) for i, g in enumerate(gaps)]
+        # 整行拉开字距排的（"学 思 践 悟"、"剖 析 案 例"）每个字之间都空，那是字距，不是空格：以这一行的常见字距为基准
+        normal = [g for k, g in enumerate(gaps) if ln.text[k] not in _PUNCT_L and ln.text[k + 1] not in _PUNCT_R]
+        base = float(np.median(normal)) if normal else 0.0
+        splits, spaces = [], []
+        if len(normal) >= 4 and float(np.percentile(normal, 30)) >= 0.35 * fs:
+            gaps = []                                          # 常见字距本身就很宽：整行是拉开字距排的，不拆也不补空格
+        for i, g in enumerate(gaps):
+            if ln.text[i] in _PUNCT_L or ln.text[i + 1] in _PUNCT_R or " " in ln.text[i:i + 2]:
+                continue
+            extra = g - base
+            if extra >= 0.9 * fs and g >= 3 * max(base, 1):
+                splits.append(i + 1)
+            elif fs >= 36 and ln.text[i].isalnum() and ln.text[i + 1].isalnum() and g >= max(0.3 * fs, 2.5 * max(base, 1)) \
+                    and _side_color_diff(roi, ink, ln, i) > 90:
+                splits.append(i + 1)                           # 空白两边颜色完全不同（粉色"05" + 红色"经百战"）：是两段不同样式的字
+            elif extra >= 0.45 * fs and g >= 3 * max(base, 1) and not (ln.text[i].isascii() and ln.text[i + 1].isascii()):
+                spaces.append(i + 1)
+        if not splits and not spaces:
+            out.append(ln)
+            continue
+        cuts = [0] + splits + [len(ln.text)]
+        for a, b in zip(cuts[:-1], cuts[1:]):
+            text, chars = "", []
+            for k in range(a, b):
+                if k in spaces and k > a:
+                    text += " "
+                    chars.append((ln.chars[k - 1][1], ln.chars[k][0]))
+                text += ln.text[k]
+                chars.append(tuple(ln.chars[k]))
+            x0, x1 = ln.chars[a][0], ln.chars[b - 1][1]
+            nl = Line(text, int(x0), ln.y, int(x1 - x0), ln.h)
+            nl.chars, nl.score = chars, ln.score
+            out.append(nl)
+    return out
 
 
 def fix_number_columns(lines):
@@ -776,6 +1063,18 @@ def detect_italic(lines):
         # 只对纯数字 / 英文的短文字判断（页码"06"这类）：汉字笔画横竖撇捺都有，量不准，而且中文很少用斜体
         if not ln.badge and ln.text.isascii() and ln.text.isalnum() and len(ln.text) <= 6:
             ln.italic = is_it(ln.slant)
+        elif not ln.badge and ln.ink and ln.size_px >= 14 and len(ln.text.strip()) >= 2 and ln.slant[0] >= 0.12 and ln.slant[1] >= 1.08:
+            # 中文行：汉字自带撇捺，单看倾斜量不准。把同样的字用正体排一遍量出"天生的倾斜"，原图明显更斜才算斜体
+            f = ref_font(100, ln.bold, getattr(ln, "family", "sans"))
+            bb = f.getbbox(ln.text)
+            if bb[2] > bb[0] and bb[3] > bb[1]:
+                im = Image.new("L", (bb[2] - bb[0] + 6, bb[3] - bb[1] + 6), 0)
+                ImageDraw.Draw(im).text((3 - bb[0], 3 - bb[1]), ln.text, font=f, fill=255)
+                a = np.asarray(im) > 127
+                sc = (ln.ink[3] - ln.ink[1]) / float(a.shape[0])
+                a = cv2.resize(a.astype(np.uint8), None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA) > 0
+                ref = _slant(a)
+                ln.italic = ln.slant[0] - ref[0] >= 0.12 and ln.slant[1] >= ref[1] + 0.06
     badges = [ln for ln in lines if ln.badge]
     if badges:
         yes = sum(is_it(ln.slant) for ln in badges) >= 0.6 * len(badges)
@@ -2481,6 +2780,129 @@ def _merge_close(masks, gap, max_side):
 # ----------------------------------------------------------------------------
 # 把相邻的行合并成一个文本框（同一段落 / 同一组要点）
 # ----------------------------------------------------------------------------
+def harmonize_bold(lines):
+    """同一列里连续的几行（同颜色、同字号、左边对齐的列表 / 段落）粗细应该一致。
+    单独量一行的笔画粗细有误差，偶尔会把一行正文判成粗体：按这一组的多数纠正。"""
+    todo = sorted([l for l in lines if not l.badge and l.ink and not (l.runs and len(l.runs) > 1)], key=lambda l: (l.ink[0], l.y))
+    used = set()
+    for a in todo:
+        if id(a) in used:
+            continue
+        grp = [a]
+        for b in sorted(todo, key=lambda l: l.y):
+            if b is a or id(b) in used or b.y <= grp[-1].y:
+                continue
+            last = grp[-1]
+            if (abs(b.ink[0] - last.ink[0]) < 0.6 * last.size_px and abs(b.size_px - last.size_px) < 0.15 * last.size_px
+                    and _color_close(b.color, last.color) and b.baseline - last.baseline < 2.2 * last.size_px):
+                grp.append(b)
+        if len(grp) == 2 and grp[0].bold != grp[1].bold and all(getattr(g, "family", "") == "serif" for g in grp):
+            # 只有两行（一段折成两行）的宋体：和宋体参考比粗细误差大，笔画粗细其实差不多（相差不到 15%）却一粗一细，是量的误差，按常规体统一
+            a_, b_ = grp
+            ra = getattr(a_, "stroke", 0) / max(1.0, a_.size_px)
+            rb = getattr(b_, "stroke", 0) / max(1.0, b_.size_px)
+            if ra > 0 and rb > 0 and max(ra, rb) / min(ra, rb) < 1.15:
+                for g in grp:
+                    used.add(id(g))
+                    g.bold = False
+                    g.heavy = False
+                    if g.runs:
+                        g.runs = [(t, c, False, px) for t, c, b2, px in g.runs]
+            continue
+        if len(grp) < 3:
+            continue
+        for g in grp:
+            used.add(id(g))
+        nb = sum(len(g.text) for g in grp if g.bold)
+        nt = sum(len(g.text) for g in grp)
+        major = nb * 3 >= nt * 2
+        if nb * 3 >= nt * 2 or nb * 3 <= nt:
+            for g in grp:
+                g.bold = major
+                if g.runs:
+                    g.runs = [(t, c, major, px) for t, c, b_, px in g.runs]
+
+
+def harmonize_accents(lines):
+    """正文里标成别的颜色的重点词（红色的"一等奖""参赛""任宿舍长"）：同一页同一种颜色的短重点词，设计上粗细一致。
+    单独量几个字的笔画误差大，只要其中有一个明显是粗体，同色的短重点词都按粗体。
+    行首的重点词如果是上一行同色重点词的延续（一句话折行了），粗细跟上一行那段走。"""
+    def cjk(t):
+        return sum("\u4e00" <= c <= "\u9fff" for c in t)
+    def dist(a, b):
+        return float(np.linalg.norm(np.array(a, float) - np.array(b, float)))
+    # 正文色：全页按字数最多的那种颜色（"国赛 一等奖"里重点词比正文还长，不能按每行最长的一段当正文）
+    pool = []
+    for ln in lines:
+        for t, c, b, px in (ln.runs or [(ln.text, ln.color, ln.bold, ln.size_px)]):
+            pool.append((c, cjk(t)))
+    if not pool:
+        return
+    body = max(pool, key=lambda p: sum(n for c, n in pool if dist(c, p[0]) < 60))[0]
+    acc, base_of = {}, {}                                      # id(ln) -> [重点词下标]、正文段下标
+    for ln in lines:
+        if ln.badge or not ln.runs or len(ln.runs) < 2:
+            continue
+        k0 = int(np.argmin([dist(c, body) for t, c, b, px in ln.runs]))
+        base_of[id(ln)] = k0
+        acc[id(ln)] = [k for k, r in enumerate(ln.runs) if k != k0 and dist(r[1], ln.runs[k0][1]) >= 60 and cjk(r[0])]
+    def clearly_bold(ln, k):
+        if ln.runs[k][2]:
+            return True
+        st = ln.run_strokes
+        k0 = base_of[id(ln)]
+        if not st or len(st) != len(ln.runs) or st[k0] <= 0 or st[k] <= 0:
+            return False
+        return (st[k] / ln.runs[k][3]) / (st[k0] / ln.runs[k0][3]) >= 1.2   # 按字号折算后笔画明显更粗
+    def set_bold(ln, k, b):
+        t, c, _, px = ln.runs[k]
+        r = list(ln.runs)
+        r[k] = (t, c, bool(b), px)
+        ln.runs = r
+    linked, links = set(), []
+    srt = sorted([l for l in lines if l.ink], key=lambda l: l.y)
+    for ln in srt:
+        if not acc.get(id(ln)) or acc[id(ln)][0] != 0:
+            continue
+        prev = [p for p in srt if p is not ln and p.ink and p.runs and 0 < ln.baseline - p.baseline < 2.2 * ln.size_px
+                and abs(p.ink[0] - ln.ink[0]) < 0.8 * ln.size_px]
+        if not prev:
+            continue
+        p = max(prev, key=lambda q: q.baseline)
+        last = p.runs[-1]
+        if dist(last[1], ln.runs[0][1]) < 90 and cjk(last[0]) and (len(p.runs) == 1 or len(p.runs) - 1 in acc.get(id(p), [])) \
+                and last[0].rstrip()[-1:] not in "。；！？;!?：:":
+            links.append((ln, p))                              # 折行的同一句话：粗细、颜色都跟上一行那段（分组定完粗细后再跟）
+            linked.add((id(ln), 0))
+    groups = []
+    for ln in lines:
+        for k in acc.get(id(ln), []):
+            if (id(ln), k) in linked or cjk(ln.runs[k][0]) > 12:
+                continue
+            for g in groups:
+                if dist(g[0][0].runs[g[0][1]][1], ln.runs[k][1]) < 90:
+                    g.append((ln, k))
+                    break
+            else:
+                groups.append([(ln, k)])
+    for g in groups:
+        if any(clearly_bold(ln, k) for ln, k in g):
+            for ln, k in g:
+                set_bold(ln, k, True)
+        # 同一组重点词用同一个颜色（几个字量出来的颜色偏浅偏深，取最饱和的那个）
+        cols = [ln.runs[k][1] for ln, k in g]
+        best = max(cols, key=lambda c: max(c) - min(c))
+        for ln, k in g:
+            t, c, b, px = ln.runs[k]
+            r = list(ln.runs)
+            r[k] = (t, best, b, px)
+            ln.runs = r
+    for ln, p in links:                                        # 按从上到下的顺序跟，连续折几行也能传下去
+        last = p.runs[-1]
+        set_bold(ln, 0, last[2])
+        ln.runs = [(ln.runs[0][0], last[1]) + tuple(ln.runs[0][2:])] + list(ln.runs[1:])
+
+
 def group_lines(lines):
     lines = sorted(lines, key=lambda l: (l.y, l.x))
     blocks = []
@@ -2569,7 +2991,7 @@ def add_slide(prs, clean_bgr, blocks, icons, img_w, img_h, font_name):
             p.alignment = PP_ALIGN.CENTER if b.align == "center" else PP_ALIGN.LEFT
             p.line_spacing = Pt(pitch_pt)
             runs = ln.runs or [(ln.text, ln.color, ln.bold, ln.size_px)]
-            for seg, color, bold, seg_px in runs:
+            for ri, (seg, color, bold, seg_px) in enumerate(runs):
                 run = p.add_run()
                 run.text = seg
                 # 单色行用整个文本框统一的字号；多色行每段用自己的字号
@@ -2582,8 +3004,14 @@ def add_slide(prs, clean_bgr, blocks, icons, img_w, img_h, font_name):
                 run.font.bold = bold
                 run.font.color.rgb = RGBColor(*color)
                 # 字体：审核时判断出这一行是宋体还是黑体；命令行明确指定了别的字体时以指定的为准
-                fname = PPT_FONTS.get(ln.family, font_name) if font_name == default_ppt_font() else font_name
-                run.font.name = fname
+                fam = "serif_bold" if ln.family == "serif" and bold else ln.family
+                fname = PPT_FONTS.get(fam, font_name) if font_name == default_ppt_font() else font_name
+                if fam == "serif_bold":
+                    run.font.bold = bool(ln.heavy) or bool(ln.heavy_runs and ri in ln.heavy_runs)   # 华文中宋本身就粗，再勾"加粗"只给特别粗的
+                # 西文字母 / 数字：宋体里的英文是等宽的"P y t h o n"，很难看，改用 Times New Roman（中文仍用宋体）
+                # （纯数字 / 英文的行——页码、编号——字号是按宋体量的，仍用原字体，免得变小）
+                mixed = any("\u4e00" <= ch_ <= "\u9fff" for ch_ in ln.text) and any(ch_.isascii() and ch_.isalnum() for ch_ in ln.text)
+                run.font.name = "Times New Roman" if fam in ("serif", "serif_bold") and mixed and font_name == default_ppt_font() else fname
                 rPr = run._r.get_or_add_rPr()                  # 中文要单独指定东亚字体
                 ea = rPr.find(qn("a:ea"))
                 if ea is None:
@@ -2791,7 +3219,18 @@ def attach_dashes(img_bgr, lines, full_mask):
         col = np.array(ln.color[::-1], np.float32)                 # 文字色（BGR）
         ix0, iy0, ix1, iy1 = ln.ink
         ya, yb = int(iy0 + 0.25 * (iy1 - iy0)), int(iy0 + 0.8 * (iy1 - iy0))
+        def has_bar(side):
+            xa, xb = (max(0, int(ix0 - 5.5 * s)), max(0, ix0 - 2)) if side == "left" else (min(W, ix1 + 2), min(W, int(ix1 + 5.5 * s)))
+            if xb - xa < 0.8 * s or yb - ya < 3:
+                return False
+            like = (np.linalg.norm(f[ya:yb, xa:xb] - col, axis=2) < 60).astype(np.uint8)
+            n_, _, st_, _ = cv2.connectedComponentsWithStats(like, connectivity=8)
+            return any(st_[i][3] <= max(3, 0.16 * s) and st_[i][2] >= 0.8 * s for i in range(1, n_))
+        if has_bar("left") and has_bar("right"):
+            continue                                               # 两边对称的横线（"—— 责任 · 服务 —— "）是装饰，不是破折号
         for side in ("left", "right"):
+            if side == "right" and ln.text[-1:] in "！？。!?…":
+                continue                                           # 句末标点后面的横线是装饰线，不是破折号
             xa, xb = (max(0, int(ix0 - 5.5 * s)), max(0, ix0 - 2)) if side == "left" else (min(W, ix1 + 2), min(W, int(ix1 + 5.5 * s)))
             if xb - xa < 0.8 * s or yb - ya < 3:
                 continue
@@ -3051,6 +3490,7 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     process_image.last_ocr = copy.deepcopy(lines)
     lines = _clean_lines(lines, W)
     strip_side_bars(img, lines)
+    lines = split_wide_gaps(img, lines)
     fix_number_columns(lines)
     badges, lines = find_badges(img, lines)                    # 序号先分出来：圆圈归图形，里面的字归文字
     mask = np.zeros((H, W), np.uint8)
@@ -3202,7 +3642,9 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     attach_trailing_punct(img, kept, mask)
     tell("audit")
     unify_sizes(kept)
-    art = audit_lines(img, kept, mask)                         # 审核：定字体；对不上的艺术字留在图里
+    art = audit_lines(img, kept, mask)
+    harmonize_bold([ln for ln in kept if ln not in art])
+    harmonize_accents([ln for ln in kept if ln not in art])                         # 审核：定字体；对不上的艺术字留在图里
     kept = [ln for ln in kept if ln not in art]
     if photo_blocks:                                           # 整张照片里面的小图 / 图标：跟着照片走，不单独再抠一份
         def in_block(ic):
@@ -3215,6 +3657,18 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     icons = pics + icons
     tell("erase")
     clean, how = erase_text(img, np.maximum(mask, icon_mask), inpaint, smooth, pic_mask)
+    # 转成文字的那几行如果有一部分压在抠出来的图片上（照片底部的标题横幅），图片里那部分字也要抹掉，
+    # 否则图片盖在文字框上面，会出现"原图的字 + 文本框的字"两层重影
+    tmask = cv2.dilate(mask, np.ones((5, 5), np.uint8)) > 0
+    for p in pics:
+        if p.rgba is None:
+            continue
+        ph, pw = p.rgba.shape[:2]
+        sub = tmask[p.y:p.y + ph, p.x:p.x + pw]
+        if sub.shape != (ph, pw) or not sub.any():
+            continue
+        sub = sub & (p.rgba[:, :, 3] > 0)
+        p.rgba[:, :, :3][sub] = clean[p.y:p.y + ph, p.x:p.x + pw][sub]
     if bars is not None and bars.shape == mask.shape:          # 时间轴留在底图里：抹掉旁边的图片时不能蹭掉它的边
         keep_bar = (bars > 0) & (cv2.dilate(mask, np.ones((5, 5), np.uint8)) == 0)
         clean[keep_bar] = img[keep_bar]
