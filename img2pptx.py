@@ -72,9 +72,13 @@ class Line:
     badge: bool = False         # 这行字是不是某个序号圆圈里的字
     disc: tuple = None          # 所在圆圈的 (圆心 x, 圆心 y, 半径)
     italic: bool = False        # 是不是斜体
+    family: str = "sans"         # 字体类别：sans 黑体 / serif 宋体（由审核决定）
+    audit: float = 1.0          # 审核分：按设定字体回渲染后和原图笔画的吻合度 0–1
     slant: tuple = (0.0, 1.0, 0.0)   # 量出来的倾斜程度 (斜率, 比不倾斜时清晰多少倍)
     fit: float = 0.0            # 字距修正（相对字号的比例）：原图的字比参考字体窄 / 宽多少
     chars: list = None          # 每个字的横向范围 [(x0, x1)]，OCR 能提供时才有
+    own_mask: tuple = None
+    stroke: float = 0.0
     runs: list = None           # 一行内按颜色拆开的片段 [(文字, 颜色, 是否加粗, 字号像素)]
 
 
@@ -102,13 +106,28 @@ _FONT_CANDIDATES = {
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     ],
 }
+# 宋体（衬线体）参考字体：审核时和黑体比对，决定这一行在 PPT 里用哪种字体
+_SERIF_CANDIDATES = {
+    False: [
+        "C:/Windows/Fonts/simsun.ttc",
+        ("/System/Library/Fonts/Supplemental/Songti.ttc", 6),      # macOS：宋体-简 常规
+        ("/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc", 2),
+    ],
+    True: [
+        "C:/Windows/Fonts/simsun.ttc",
+        ("/System/Library/Fonts/Supplemental/Songti.ttc", 1),      # macOS：宋体-简 粗体
+        ("/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc", 2),
+    ],
+}
+PPT_FONTS = {"sans": "Microsoft YaHei", "serif": "SimSun"}     # PPT 里写的字体名：Windows、Mac 版 Office 都自带
 _font_cache = {}
 
 
-def ref_font(size, bold=False):
-    key = (int(size), bold)
+def ref_font(size, bold=False, family="sans"):
+    key = (int(size), bold, family)
     if key not in _font_cache:
-        for cand in _FONT_CANDIDATES[bold]:
+        cands = (_SERIF_CANDIDATES[bold] if family == "serif" else []) + _FONT_CANDIDATES[bold]   # 找不到宋体就退回黑体
+        for cand in cands:
             path, index = cand if isinstance(cand, tuple) else (cand, 0)
             if os.path.exists(path):
                 _font_cache[key] = ImageFont.truetype(path, int(size), index=index)
@@ -338,6 +357,8 @@ def analyze_line(img_bgr, ln, full_mask):
     k = max(3, int(round(ln.size_px * 0.08)) | 1)             # 这里只贴着笔画留一点边，更宽的范围由 erase_text 处理
     m = cv2.dilate(ink.astype(np.uint8) * 255, np.ones((k, k), np.uint8))
     full_mask[y0:y1, x0:x1] = np.maximum(full_mask[y0:y1, x0:x1], m)
+    ln.own_mask = (x0, y0, m)                                  # 这一行自己的掩膜：审核时要把某行退回成图片，只撤掉它自己的
+    ln.stroke = sw                                             # 量出来的笔画宽度：审核换字体后重新判断粗细
     return True
 
 
@@ -513,16 +534,237 @@ def refit_widths(lines):
         width = 0.0
         for seg, _, bold, px in runs:
             if seg:
-                width += ref_font(200, bold).getlength(seg) * px / 200.0
+                width += ref_font(200, bold, ln.family).getlength(seg) * px / 200.0
         n = max(1, len(ln.text))
         need = (target - width) / n / ln.size_px
-        ln.fit = float(np.clip(need, -0.06, 0.01 if lead else 0.03))
+        ln.fit = float(np.clip(need, -0.06, 0.01 if lead else (1.6 if need > 0.25 else 0.03)))   # 明显拉开字距排的字（"学 思 践 悟"）照原样拉开
         if need < -0.06:
             # 原图用的是更窄的字体。字距收到 6% 已经是极限（再收字就叠在一起了），剩下的差距靠把字号调小一点补上
             k = float(np.clip(target / (width + ln.fit * n * ln.size_px), 0.86, 1.0))
             ln.size_px *= k
             if ln.runs:
                 ln.runs = [(t, c, b_, px * k) for t, c, b_, px in ln.runs]
+
+
+def _render_line_mask(text, h, w, family, bold, gaps):
+    """把一行字用参考字体排出来，缩放到原图这行字的大小，返回布尔笔画图。
+    gaps=True 时每个字按原图的平均位置均匀摆开（"学 思 践 悟"这种宽字距排法）。"""
+    f = ref_font(100, bold, family)
+    if not gaps:
+        bb = f.getbbox(text)
+        if bb[2] - bb[0] <= 0 or bb[3] - bb[1] <= 0:
+            return None
+        im = Image.new("L", (bb[2] - bb[0] + 4, bb[3] - bb[1] + 4), 0)
+        ImageDraw.Draw(im).text((2 - bb[0], 2 - bb[1]), text, font=f, fill=255)
+        a = np.asarray(im) > 110
+        ys, xs = np.where(a)
+        if not len(ys):
+            return None
+        a = a[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        return cv2.resize(a.astype(np.uint8), (w, h), interpolation=cv2.INTER_AREA) > 0
+    out = np.zeros((h, w), bool)
+    cw = w / len(text)
+    for i, c in enumerate(text):
+        bb = f.getbbox(c)
+        if bb[2] - bb[0] <= 0 or bb[3] - bb[1] <= 0:
+            continue
+        gw = max(1, min(int(round(cw)), int(round((bb[2] - bb[0]) * h / 100.0))))
+        im = Image.new("L", (bb[2] - bb[0] + 4, bb[3] - bb[1] + 4), 0)
+        ImageDraw.Draw(im).text((2 - bb[0], 2 - bb[1]), c, font=f, fill=255)
+        g = np.asarray(im) > 110
+        gy, gx = np.where(g)
+        if not len(gy):
+            continue
+        g = g[gy.min():gy.max() + 1, gx.min():gx.max() + 1]
+        gh = max(1, min(h, int(round(g.shape[0] * h / 100.0))))
+        r = cv2.resize(g.astype(np.uint8), (gw, gh), interpolation=cv2.INTER_AREA) > 0
+        x0, y0 = int(round(i * cw + (cw - gw) / 2)), (h - gh) // 2
+        ww = max(0, min(gw, w - x0))
+        out[y0:y0 + gh, x0:x0 + ww] |= r[:, :ww]
+    return out
+
+
+def _stroke_contrast(ink):
+    """横笔画粗细 ÷ 竖笔画粗细。宋体"横细竖粗"，这个比值明显小于 1（约 0.5）；黑体横竖一样粗（约 0.9–1）。
+    和字体粗细无关，也不依赖电脑上装了哪种参考字体，用来判断宋体 / 黑体最稳。字太小量不准时返回 None。"""
+    big = cv2.resize(ink.astype(np.uint8) * 255, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC) > 127
+    def run_lengths(a):
+        out = []
+        for row in a:
+            d = np.diff(np.concatenate([[0], row.astype(np.int8), [0]]))
+            out.append(np.where(d == -1)[0] - np.where(d == 1)[0])
+        return np.concatenate(out) if out else np.zeros(0)
+    lim = 0.25 * big.shape[0]
+    v = run_lengths(big.T)                                     # 每列里连续笔画的长度 = 横笔画的粗细
+    h = run_lengths(big)                                       # 每行里 = 竖笔画的粗细
+    v, h = v[v < lim], h[h < lim]
+    if len(v) < 20 or len(h) < 20:
+        return None
+    return float(np.median(v)) / max(1.0, float(np.median(h)))
+
+
+def audit_lines(img_bgr, lines, full_mask):
+    """审核：每一行文字都按"黑体 / 宋体 × 常规 / 加粗"回渲染，和原图里这行字的笔画逐像素比对。
+      · 哪种字体吻合度高，这一行在 PPT 里就用哪种（整页先投票定基调，差别明显的行才单独换）
+      · 哪种都对不上的大字（书法、艺术字），说明换成文本框会走样：不转文字，原样留在图里
+    每行记下审核分 ln.audit。返回被留在图里的行。"""
+    H, W = img_bgr.shape[:2]
+    scores = []
+    for ln in lines:
+        if ln.badge or not ln.ink or len(ln.text.strip()) == 0:
+            scores.append(None)
+            continue
+        x0, y0, x1, y1 = ln.ink
+        if y1 - y0 < 8 or x1 - x0 < 8:
+            scores.append(None)
+            continue
+        roi = img_bgr[y0:y1, x0:x1].astype(np.float32)
+        d = np.linalg.norm(roi - np.array(ln.color[::-1], np.float32), axis=2)
+        inks = [d < max(30.0, 0.45 * float(d.max()))]             # 按文字颜色取的笔画：细节清楚，分辨宋体 / 黑体靠它
+        if ln.own_mask is not None:                            # 分析这行时抠出的笔画：已排除底色，判断"对不对得上"更稳
+            mx, my, mm = ln.own_mask
+            ink = np.zeros((y1 - y0, x1 - x0), bool)
+            sy0, sx0 = max(y0, my), max(x0, mx)
+            sy1, sx1 = min(y1, my + mm.shape[0]), min(x1, mx + mm.shape[1])
+            ink[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0] = mm[sy0 - my:sy1 - my, sx0 - mx:sx1 - mx] > 0
+            kk = max(3, int(round(ln.size_px * 0.08)) | 1)     # 那份笔画外扩过一圈，收回来
+            inks.append(cv2.erode(ink.astype(np.uint8), np.ones((kk, kk), np.uint8)) > 0)
+        # 原图比参考字体排出来宽很多：是拉开字距排的
+        nat = ref_font(100, ln.bold).getlength(ln.text) * (y1 - y0) / 100.0
+        gaps = len(ln.text) > 1 and (x1 - x0) > 1.3 * nat
+        k = np.ones((3, 3), np.uint8)
+        # 不同电脑上的参考字体粗细不一样（Mac 的宋体比原图细得多），直接比会变成"比粗细"而不是"比字形"。
+        # 所以先把排出来的字加粗 / 减细到和原图一样的笔画宽度，再比较
+        sw_i = _stroke_width(inks[0]) if inks[0].any() else 0.0
+        renders = {}
+        for fam in ("sans", "serif"):
+            for bold in (False, True):
+                r = _render_line_mask(ln.text, y1 - y0, x1 - x0, fam, bold, gaps)
+                if r is None:
+                    continue
+                if sw_i > 0 and r.any():
+                    dlt = int(round((sw_i - _stroke_width(r)) / 2.0))
+                    if dlt > 0:
+                        r = cv2.dilate(r.astype(np.uint8), np.ones((2 * dlt + 1, 2 * dlt + 1), np.uint8)) > 0
+                    elif dlt < 0:
+                        r2 = cv2.erode(r.astype(np.uint8), np.ones((-2 * dlt + 1, -2 * dlt + 1), np.uint8)) > 0
+                        r = r2 if r2.sum() > 0.3 * r.sum() else r
+                renders[(fam, bold)] = cv2.dilate(r.astype(np.uint8), k) > 0
+        def iou(a, b):
+            return float((a & b).sum()) / max(1.0, float((a | b).sum()))
+        best = {}
+        fit = 0.0
+        for idx, ink in enumerate(inks):
+            a = cv2.dilate(ink.astype(np.uint8), k) > 0
+            for (fam, bold), b in renders.items():
+                v = iou(a, b)
+                if idx == 0:
+                    best[fam] = max(best.get(fam, 0.0), v)
+                fit = max(fit, v)
+        best["fit"] = fit
+        best["contrast"] = _stroke_contrast(inks[0]) if ln.size_px >= 28 else None    # 小字笔画只有一两个像素，量不出横竖差别
+        scores.append(best)
+    # 整页投票：同一页通常只用一两种字体，单行比对有误差，先看大多数
+    # 宋体 / 黑体按"横竖笔画粗细比"判断；整页先投票定基调
+    vote = sum((0.7 - s["contrast"]) * len(ln.text) for s, ln in zip(scores, lines) if s and s.get("contrast") is not None)
+    page = "serif" if vote > 0 else "sans"
+    dropped = []
+    for s, ln in zip(scores, lines):
+        if not s:
+            continue
+        c = s.get("contrast")
+        ln.family = "serif" if c is not None and c <= 0.55 else "sans" if c is not None and c >= 0.85 else page
+        if ln.text.isascii():
+            ln.family = page                                   # 数字、字母没有"横细竖粗"可量，跟整页走
+        ln.audit = s["fit"]
+        # 大字两种字体都对不上：书法 / 艺术字。小字对不上多半是识别时混进了符号，仍按文字处理
+        if os.environ.get("AUDITDBG"):
+            print("   audit %-5s fit %.2f contrast %s  %s" % (ln.family, s["fit"], "%.2f" % s["contrast"] if s.get("contrast") is not None else " -- ", ln.text[:16]))
+        if ln.audit < 0.36 and ln.size_px >= 40 and len(ln.text) >= 2:
+            dropped.append(ln)
+    for ln in dropped:                                         # 不抹掉：这行字原样留在底图里（只撤掉它自己的掩膜）
+        if ln.own_mask is None:
+            continue
+        mx, my, m = ln.own_mask
+        full_mask[my:my + m.shape[0], mx:mx + m.shape[1]][m > 0] = 0
+    for ln in lines:                                           # 和它挨着的行掩膜可能被一起撤掉了，补回来
+        if ln in dropped or ln.own_mask is None:
+            continue
+        mx, my, m = ln.own_mask
+        sub = full_mask[my:my + m.shape[0], mx:mx + m.shape[1]]
+        sub[...] = np.maximum(sub, m[:sub.shape[0], :sub.shape[1]])
+    # 粗细仍按黑体参考字体量出来的结果：各电脑上的宋体粗细差别很大（Mac 的宋体比原图细得多），用它判断会把常规字都判成粗体
+    return dropped
+
+
+def fix_number_columns(lines):
+    """编号列（01、02、03……竖着排成一列）的纠错：斜体的"0"常被认成字母 O，顺序还可能颠倒成"1O"。
+    同一列、同样大小的两位编号，如果大多数连成了等差序列，就按序列把认错的那个改回来。"""
+    def num(t):
+        t = t.replace("O", "0").replace("o", "0")
+        return int(t) if len(t) == 2 and t.isdigit() else None
+    cand = [ln for ln in lines if len(ln.text) == 2 and all(c.isdigit() or c in "Oo" for c in ln.text)]
+    used = set()
+    for a in cand:
+        if id(a) in used:
+            continue
+        col = [b for b in cand if abs(b.x - a.x) <= 0.8 * a.h and 0.75 < b.h / max(1, a.h) < 1.33]
+        if len(col) < 3:
+            continue
+        col.sort(key=lambda l: l.y)
+        for b in col:
+            used.add(id(b))
+        vals = [num(b.text) for b in col]
+        # 以"位置 i 上应该是 start + i"来投票找起点
+        starts = [v - i for i, v in enumerate(vals) if v is not None]
+        if not starts:
+            continue
+        start = max(set(starts), key=starts.count)
+        if starts.count(start) < 0.6 * len(col):
+            continue
+        for i, b in enumerate(col):
+            want = "%02d" % (start + i)
+            if b.text != want and 0 <= start + i < 100:
+                b.text, b.chars = want, None
+
+
+def strip_side_bars(img_bgr, lines):
+    """标题旁边的竖色块（"▌目录"、"04 ▌听百讲"中间那一竖）常被识别成"1""I""|""■"。
+    逐个检查这些字：如果它其实是一根几乎实心的竖条，就不是字，从这行里去掉（色块留在底图里）。"""
+    for ln in lines:
+        if not ln.chars or len(ln.chars) != len(ln.text) or len(ln.text) < 2:
+            continue
+        drop = []
+        for k, c in enumerate(ln.text):
+            if c not in "1Il|丨■▌▍█":
+                continue
+            if c in "1Il" and k + 1 < len(ln.text) and ln.text[k + 1].isdigit():
+                run = len(ln.text[k + 1:]) - len(ln.text[k + 1:].lstrip("0123456789"))
+                if run < 2:
+                    continue                                   # "10"里的 1（后面只跟一位数字）：是数字，不是色块
+                # "108"：章节号一般两位，多出来的那个 1 是前面的竖色块
+            cx0, cx1 = ln.chars[k]
+            roi = img_bgr[ln.y:ln.y + ln.h, max(0, cx0 - 2):cx1 + 2].astype(np.float32)
+            if roi.size == 0:
+                continue
+            bg = np.median(np.concatenate([roi[:, 0], roi[:, -1], roi[0], roi[-1]]), axis=0)
+            ink = (np.linalg.norm(roi - bg, axis=2) > 60).astype(np.uint8)
+            n, lab, st, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+            if n < 2:
+                continue
+            j = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+            x, y, w, h, area = st[j]
+            if h >= 0.6 * ln.h and 0.12 * h <= w <= 0.4 * h and area >= 0.85 * w * h:
+                drop.append(k)                                 # 太细的"|"是正文里的分隔符，留着
+        if not drop:
+            continue
+        keep = [k for k in range(len(ln.text)) if k not in drop]
+        ln.text = "".join(ln.text[k] for k in keep).strip()
+        ln.chars = [ln.chars[k] for k in keep]
+        if ln.chars:
+            nx, ex = ln.chars[0][0], ln.x + ln.w
+            if 0 in drop:
+                ln.w, ln.x = ex - nx, nx
 
 
 def detect_italic(lines):
@@ -1244,7 +1486,7 @@ def _flat_graphics(img_bgr, text_mask, edge):
             out[y:y + h, x:x + w] = np.maximum(out[y:y + h, x:x + w], patch)
     bars_only = cv2.dilate(out, np.ones((5, 5), np.uint8))
     vivid = vivid_all
-    labels = []
+    labels, regions = [], []
     # 2. 压着文字的纯色色块：把文字盖住的地方也算进色块（否则色块被字切成碎片），再看它是不是单一颜色
     tm = cv2.dilate(text_mask, np.ones((5, 5), np.uint8)) > 0
     n, lab, stats, _ = cv2.connectedComponentsWithStats((vivid.astype(bool) | tm).astype(np.uint8), connectivity=8)
@@ -1260,8 +1502,12 @@ def _flat_graphics(img_bgr, text_mask, edge):
         if not uniform(body, 60) or edge[cv2.erode(body.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0].mean() > 0.3:
             continue                                           # 颜色杂、有纹理：是照片上的字，不是色块
         out[sel] = 255
-        labels.append((sel, np.median(f[body], axis=0)))       # 抹这上面的字时只参考色块自己的颜色（见 process_image）
+        med = np.median(f[body], axis=0)
+        regions.append(sel)                                    # 所有压着字的色块（色带、笔刷底纹也算）
+        if (np.linalg.norm(f[body] - med, axis=1) < 30).mean() >= 0.8:
+            labels.append((sel, med))                          # 纯色标签：抹这上面的字时只参考标签自己的颜色（见 process_image）
     _flat_graphics.labels = labels
+    _flat_graphics.regions = regions
     _flat_graphics.bars = bars_only                            # 时间轴本身（给找图标的那一步用：轴上的圆点不是图标）
     return cv2.dilate(out, np.ones((7, 7), np.uint8))
 
@@ -1530,6 +1776,185 @@ def extract_pictures(img_bgr, text_mask, icons):
         masks.append(sel)
         erase = np.maximum(erase, cv2.dilate(filled, np.ones((3, 3), np.uint8)))
     return pics, erase, masks, smooth
+
+
+def find_photo_blocks(img_bgr, text_mask):
+    """找"整张照片"：合影、会场照、证书照片、书架照片……
+    它们是一块矩形（常带圆角和阴影），里面也许有字（横幅、证书上的字），但那些字属于照片，不该拆出来。
+    两种找法，结果合并：
+      A. 四条边：照片和底色之间有一圈清晰的直边。找出"左右两条竖边 + 上下两条横边"围成的矩形
+      B. 色块：浅色页面上，照片是一整块"不是底色"的区域，填掉内部空洞后接近矩形
+    候选还要过两关：去掉文字以后里面颜色仍然丰富（卡片、文本框里只剩单一底色）；
+    如果一个候选里面还套着另一个合格的候选，说明外面那个是"卡片"，留里面那张照片。
+    返回 [(x, y, w, h), ...]"""
+    H, W = img_bgr.shape[:2]
+    f = img_bgr.astype(np.float32)
+    gx, gy = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3)
+    tm = cv2.dilate(text_mask, np.ones((7, 7), np.uint8)) > 0
+    minside = 0.08 * W
+    cands = []
+    # A. 直边围成的矩形
+    ex = (np.abs(gx).max(axis=2) / 4 > 14).astype(np.uint8)
+    ey = (np.abs(gy).max(axis=2) / 4 > 14).astype(np.uint8)
+    L = int(0.05 * W)
+    hl = cv2.morphologyEx(cv2.dilate(ey, np.ones((3, 1), np.uint8)), cv2.MORPH_OPEN, np.ones((1, L), np.uint8))
+    vl = cv2.morphologyEx(cv2.dilate(ex, np.ones((1, 3), np.uint8)), cv2.MORPH_OPEN, np.ones((L, 1), np.uint8))
+    hl = cv2.dilate(hl, np.ones((7, 7), np.uint8))
+    vl = cv2.dilate(vl, np.ones((7, 7), np.uint8))
+    nv, _, sv, _ = cv2.connectedComponentsWithStats(vl, connectivity=8)
+    vs = [sv[i] for i in range(1, nv) if sv[i][3] >= minside]
+    for a in vs:
+        for b in vs:
+            x1, x2 = a[0] + a[2] // 2, b[0] + b[2] // 2
+            if x2 - x1 < minside:
+                continue
+            y0, y1 = max(a[1], b[1]), min(a[1] + a[3], b[1] + b[3])
+            if y1 - y0 < minside:
+                continue
+            rows = np.where(hl[y0:y1, x1 + 3:x2 - 3].mean(axis=1) > 0.85)[0]
+            if len(rows) >= 2 and rows[-1] - rows[0] >= minside:
+                cands.append((int(x1), int(y0 + rows[0]), int(x2 - x1), int(rows[-1] - rows[0]), 0))   # 最后一位：来源 A
+    # B. 非底色的整块
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    nb = ((hsv[..., 2] < 215) | (hsv[..., 1] > 45)).astype(np.uint8)
+    if nb.mean() < 0.5:                                        # 页面底色本身是浅色时才用这种找法
+        nb = cv2.morphologyEx(nb, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        cs, _ = cv2.findContours(nb, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        fill = np.zeros_like(nb)
+        cv2.drawContours(fill, cs, -1, 1, cv2.FILLED)
+        fill = cv2.morphologyEx(fill, cv2.MORPH_OPEN, np.ones((15, 15), np.uint8))
+        n, _, st, _ = cv2.connectedComponentsWithStats(fill, connectivity=8)
+        for i in range(1, n):
+            x, y, w, h, area = st[i]
+            if min(w, h) >= minside and area >= 0.8 * w * h:
+                cands.append((int(x), int(y), int(w), int(h), 1))   # 来源 B
+    edge_all = (np.sqrt(gx ** 2 + gy ** 2).max(axis=2) / 4.0 > 12)
+    # 逐个审核候选
+    good = []
+    for x, y, w, h, src in cands:
+        if x <= 2 or y <= 2 or x + w >= W - 2 or y + h >= H - 2 or w * h > 0.6 * W * H:
+            continue
+        p = 6
+        sub = f[y + p:y + h - p, x + p:x + w - p]
+        t = ~tm[y + p:y + h - p, x + p:x + w - p]
+        if sub.size == 0 or t.mean() < 0.4:
+            continue                                           # 里面大半是字：是文本框
+        px = sub[t]
+        # 去掉文字后，占得最多的那种颜色占多大比例：卡片 / 文本框大部分是一种底色；照片里颜色到处在变
+        q = (px // 24).astype(np.int32)
+        key = q[:, 0] * 4096 + q[:, 1] * 64 + q[:, 2]
+        mode = np.bincount(key).argmax()
+        mc = np.array([mode // 4096, mode // 64 % 64, mode % 64], np.float32) * 24 + 12
+        dom = float((np.linalg.norm(px - mc, axis=1) < 30).mean())
+        # 证书、海报这类"纸面照片"底色单一，但四周有一圈花边：量紧贴边框内侧一圈的细节
+        bw_ = max(6, int(0.06 * min(w, h)))
+        band = np.zeros((h, w), bool)
+        band[4:bw_, 4:w - 4] = band[h - bw_:h - 4, 4:w - 4] = True
+        band[4:h - 4, 4:bw_] = band[4:h - 4, w - bw_:w - 4] = True
+        band &= ~tm[y:y + h, x:x + w]
+        ed = edge_all[y:y + h, x:x + w][band].mean() if band.any() else 0.0
+        if os.environ.get("PICDBG"):
+            print("   photo?", (x, y, w, h), "dom", round(dom, 2), "border", round(float(ed), 2))
+        if dom > 0.45 and ed < 0.25:
+            continue                                           # 大半是一种底色、边上也没有花边：是卡片，不是照片
+        if dom > 0.45:
+            # 表格也是"底色单一 + 边上有线"，但它中间有贯穿的横线 / 竖线；证书中间没有
+            my_, mx_ = int(0.18 * h), int(0.18 * w)              # 只看中间部分：证书的内框线离边很近，不算
+            ih = hl[y + my_:y + h - my_, x + mx_:x + w - mx_]
+            iv = vl[y + my_:y + h - my_, x + mx_:x + w - mx_]
+            if ih.size and ((ih.mean(axis=1) > 0.8).any() or (iv.mean(axis=0) > 0.8).any()):
+                continue
+        good.append((x, y, w, h, dom, src))
+    # 收边：四条边往里收，直到这一行 / 列不再基本是页面底色（候选框常常多带了卡片的留白）
+    nbm = (hsv[..., 2] < 215) | (hsv[..., 1] > 45)
+    def tighten(r):
+        x, y, w, h = r[:4]
+        x0, y0, x1, y1 = x, y, x + w, y + h
+        while x1 - x0 > minside and nbm[y0:y1, x0].mean() < 0.3: x0 += 1
+        while x1 - x0 > minside and nbm[y0:y1, x1 - 1].mean() < 0.3: x1 -= 1
+        while y1 - y0 > minside and nbm[y0, x0:x1].mean() < 0.3: y0 += 1
+        while y1 - y0 > minside and nbm[y1 - 1, x0:x1].mean() < 0.3: y1 -= 1
+        return (x0, y0, x1 - x0, y1 - y0) + tuple(r[4:])
+    good = [tighten(r) if r[4] <= 0.45 else r for r in good]   # 证书类（底色单一）不收，会把纸面收没
+    # 中间有一条贯穿的底色缝：是并排的几张图被框在了一起，不是一张
+    def has_gap(r):
+        x, y, w, h = r[:4]
+        sub = nbm[y:y + h, x:x + w]
+        for prof, n in ((sub.mean(axis=0), w), (sub.mean(axis=1), h)):
+            lo, hi = int(0.05 * n), int(0.95 * n)
+            run = 0
+            for v in prof[lo:hi]:
+                run = run + 1 if v < 0.3 else 0
+                if run >= 4:
+                    return True
+        return False
+    good = [r for r in good if r[4] > 0.45 or not has_gap(r)]
+    # 套着别的合格照片的大框：把里面那些照片挖掉，看剩下的部分 —— 剩下大半是一种底色，它就只是装照片的卡片
+    def inter(a, b):
+        iw = max(0, min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]))
+        ih = max(0, min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1]))
+        return iw * ih
+    keep = []
+    for r in good:
+        inner = [o for o in good if o is not r and inter(r, o) > 0.9 * o[2] * o[3] and o[2] * o[3] < 0.8 * r[2] * r[3]]
+        if inner:
+            x, y, w, h = r[:4]
+            m = ~tm[y:y + h, x:x + w].copy()
+            for o in inner:
+                m[max(0, o[1] - y):o[1] - y + o[3], max(0, o[0] - x):o[0] - x + o[2]] = False
+            if m.mean() < 0.15:
+                # 里面那些"照片"几乎铺满了它：如果缝隙是页面底色，它是几张并排的照片 → 留里面的；
+                # 缝隙也是画面内容，说明是一张照片被里面的竖线（柱子、窗框）误切成了几块 → 留外面这张
+                rest = nbm[y:y + h, x:x + w][m]
+                if rest.size == 0 or rest.mean() < 0.5:
+                    continue
+                keep.append(r)
+                continue
+            px = f[y:y + h, x:x + w][m]
+            q = (px // 24).astype(np.int32)
+            key = q[:, 0] * 4096 + q[:, 1] * 64 + q[:, 2]
+            mode = np.bincount(key).argmax()
+            mc = np.array([mode // 4096, mode // 64 % 64, mode % 64], np.float32) * 24 + 12
+            if float((np.linalg.norm(px - mc, axis=1) < 30).mean()) > 0.45:
+                continue
+        keep.append(r)
+    # 几乎重合的只留一个：四条直边围出来的（来源 A）优先，边界最准；其次面积大的
+    keep = sorted(set(keep), key=lambda r: -r[2] * r[3])
+    out = []
+    for r in keep:
+        if any(inter(r, o) > 0.6 * min(r[2] * r[3], o[2] * o[3]) for o in out):
+            continue
+        out.append(r)
+    out = [tuple(int(v) for v in r[:4]) for r in out]
+    # 压在照片边上的文字（照片底下搭着的标签）不属于照片：把照片的边收到文字外面
+    nt, _, stt, _ = cv2.connectedComponentsWithStats((cv2.dilate(text_mask, np.ones((9, 25), np.uint8)) > 0).astype(np.uint8), connectivity=8)
+    trimmed = []
+    for x, y, w, h in out:
+        x0, y0, x1, y1 = x, y, x + w, y + h
+        for i in range(1, nt):
+            tx, ty, tw, th, _ = stt[i]
+            ix = max(0, min(x1, tx + tw) - max(x0, tx))
+            iy = max(0, min(y1, ty + th) - max(y0, ty))
+            if ix * iy == 0:
+                continue
+            if ix * iy > 0.8 * tw * th:
+                # 整个在框里：如果它贴在框的底边一带、而它上方有一条横贯的直边（照片真正的下沿），它是照片下面的标签
+                if ty > y0 + 0.72 * (y1 - y0) and tw > 0.3 * (x1 - x0):
+                    rows = hl[max(y0, ty - 45):ty, x0 + 5:x1 - 5].mean(axis=1) if x1 - x0 > 10 else np.zeros(0)
+                    hit = np.where(rows > 0.6)[0]
+                    if len(hit):
+                        y1 = int(max(y0, ty - 45) + hit[-1]) + 3
+                continue
+            if ty + th > y1 and ty > y0 + 0.5 * (y1 - y0):
+                y1 = min(y1, ty - 2)
+            elif ty < y0 and ty + th < y0 + 0.5 * (y1 - y0):
+                y0 = max(y0, ty + th + 2)
+        if min(x1 - x0, y1 - y0) >= minside:
+            trimmed.append((x0, y0, x1 - x0, y1 - y0))
+    out = trimmed
+    if os.environ.get("PICDBG"):
+        print("   photo blocks:", out)
+    return out
 
 
 def find_illustrations(img_bgr, text_mask, taken):
@@ -2156,13 +2581,15 @@ def add_slide(prs, clean_bgr, blocks, icons, img_w, img_h, font_name):
                     run._r.get_or_add_rPr().set("spc", str(int(round(ln.fit * run_pt * 100))))
                 run.font.bold = bold
                 run.font.color.rgb = RGBColor(*color)
-                run.font.name = font_name
+                # 字体：审核时判断出这一行是宋体还是黑体；命令行明确指定了别的字体时以指定的为准
+                fname = PPT_FONTS.get(ln.family, font_name) if font_name == default_ppt_font() else font_name
+                run.font.name = fname
                 rPr = run._r.get_or_add_rPr()                  # 中文要单独指定东亚字体
                 ea = rPr.find(qn("a:ea"))
                 if ea is None:
                     ea = rPr.makeelement(qn("a:ea"), {})
                     rPr.append(ea)
-                ea.set("typeface", font_name)
+                ea.set("typeface", fname)
 
 
 # ----------------------------------------------------------------------------
@@ -2358,6 +2785,8 @@ def attach_dashes(img_bgr, lines, full_mask):
     for ln in lines:
         if ln.badge or ln.size_px < 10 or not ln.ink:
             continue
+        if not any("\u4e00" <= c <= "\u9fff" for c in ln.text):
+            continue                                               # 页码、数字旁边的短横是装饰线，不是破折号
         s = ln.size_px
         col = np.array(ln.color[::-1], np.float32)                 # 文字色（BGR）
         ix0, iy0, ix1, iy1 = ln.ink
@@ -2402,6 +2831,8 @@ def attach_dashes(img_bgr, lines, full_mask):
             full_mask[ya:yb, xa:xb] = np.maximum(full_mask[ya:yb, xa:xb], cv2.dilate(m, np.ones((k, k), np.uint8)))
             if side == "left":
                 ln.text = dash + ln.text
+                if ln.text.startswith("—一"):                      # 破折号的后一半常被认成汉字"一"
+                    ln.text = "——" + ln.text[2:]
                 ln.ink = (xa + x_lo, iy0, ix1, iy1)
                 ix0 = ln.ink[0]
             else:
@@ -2413,6 +2844,8 @@ def attach_dashes(img_bgr, lines, full_mask):
                 r = list(ln.runs)
                 i = 0 if side == "left" else -1
                 r[i] = ((dash + r[i][0]) if side == "left" else (r[i][0] + dash),) + tuple(r[i][1:])
+                if side == "left" and r[0][0].startswith("—一"):
+                    r[0] = ("——" + r[0][0][2:],) + tuple(r[0][1:])
                 ln.runs = r
             ln.fit = 0.0
 
@@ -2460,6 +2893,7 @@ def attach_trailing_punct(img_bgr, lines, full_mask):
         if xb - xa < 4 or yb - ya < 4:
             continue
         col = np.array(ln.color[::-1], np.float32)
+        col_c = col
         like = (np.linalg.norm(f[ya:yb, xa:xb] - col, axis=2) < 70).astype(np.uint8)
         like[full_mask[ya:yb, xa:xb] > 0] = 0
         n, lab, stats, _ = cv2.connectedComponentsWithStats(like, connectivity=8)
@@ -2471,6 +2905,12 @@ def attach_trailing_punct(img_bgr, lines, full_mask):
             if x + w >= xb - xa - 1 or y <= 0:                    # 贴着搜索范围的边：是别的东西的一部分
                 continue
             if x > 0.55 * s:
+                continue
+            if h > 3.2 * max(1, w):
+                continue                                       # 细长的竖线（标题和副标题之间的分隔线），不是逗号
+            # 往上还连着同色的东西（标题后面那根竖线）：不是逗号
+            col = f[max(0, ya - int(0.6 * s)):ya, xa + x:xa + x + w]
+            if col.size and (np.linalg.norm(col - col_c, axis=2) < 70).any(axis=1).mean() > 0.6:
                 continue
             if best is None or x < best[0]:
                 best = (x, y, w, h, area)
@@ -2523,6 +2963,13 @@ def _clean_lines(lines, W):
     out = []
     for ln in lines:
         fixed = ln.text.replace("°℃", "℃").replace("°°", "°").replace("℃C", "℃")
+        lead = len(fixed) - len(fixed.lstrip("：:，,）)·.、;；"))
+        if lead and len(fixed) > lead + 1:                     # 项目符号被识别成了标点：去掉，圆点留在底图里
+            fixed = fixed[lead:]
+            if ln.chars and len(ln.chars) > lead:
+                nx = ln.chars[lead][0]
+                ln.w, ln.x = ln.x + ln.w - nx, nx
+                ln.chars = ln.chars[lead:]
         if fixed != ln.text:
             ln.text, ln.chars = fixed, None                    # 字数变了，逐字位置作废
         if len(ln.text) == 1 and "\u4e00" <= ln.text <= "\u9fff":
@@ -2603,6 +3050,8 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
         lines, used = run_ocr(img, engine, lang)
     process_image.last_ocr = copy.deepcopy(lines)
     lines = _clean_lines(lines, W)
+    strip_side_bars(img, lines)
+    fix_number_columns(lines)
     badges, lines = find_badges(img, lines)                    # 序号先分出来：圆圈归图形，里面的字归文字
     mask = np.zeros((H, W), np.uint8)
     kept = [ln for ln in lines if analyze_line(img, ln, mask)]
@@ -2623,6 +3072,30 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
                 pic_mask[sel] = 255
             pic_mask = cv2.dilate(pic_mask, np.ones((5, 5), np.uint8))
             smooth = cv2.bitwise_and(smooth, pic_mask)
+    photo_blocks = []
+    if with_pictures:                                          # 整张照片：先于其他图片规则，照片里的字、小图案都跟着照片走
+        for bx, by, bw, bh in find_photo_blocks(img, mask):
+            inside = [k for k, p in enumerate(pics) if bx - 6 <= p.box[0] + p.box[2] / 2 <= bx + bw + 6
+                      and by - 6 <= p.box[1] + p.box[3] / 2 <= by + bh + 6]
+            if any(pics[k].box[2] * pics[k].box[3] > 1.3 * bw * bh for k in inside):
+                continue                                       # 已经有一张更大的图把它包含了
+            if any(_iou(pics[k].box, (bx, by, bw, bh)) > 0.7 for k in range(len(pics))):
+                continue                                       # 前面已经把这张图完整抠出来了（轮廓更精细），不换
+            keep = [k for k in range(len(pics)) if k not in inside]
+            pics, pic_sel = [pics[k] for k in keep], [pic_sel[k] for k in keep]
+            filled = _rect_mask(img, bx, by, bw, bh)
+            sel = filled > 0
+            p = 2
+            x0, y0, x1, y1 = max(0, bx - p), max(0, by - p), min(W, bx + bw + p), min(H, by + bh + p)
+            alpha = cv2.GaussianBlur(filled[y0:y1, x0:x1], (3, 3), 0)
+            pics.append(Icon(x0, y0, np.dstack([img[y0:y1, x0:x1], alpha]), "图片", (bx, by, bw, bh), 80, "整张照片（里面的字跟着照片走）"))
+            photo_blocks.append((bx, by, bw, bh))
+            pic_sel.append(sel)
+        pic_mask = np.zeros((H, W), np.uint8)
+        for sel in pic_sel:
+            pic_mask[sel] = 255
+        pic_mask = cv2.dilate(pic_mask, np.ones((5, 5), np.uint8))
+        smooth = cv2.bitwise_and(smooth, pic_mask)
     tell("picture", [[int(v) for v in p.box] + [p.score, p.why] for p in pics])
     rejected = []
     if with_icons and getattr(find_badges, "round_icons", None):
@@ -2650,7 +3123,7 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
         taken0 = np.maximum(pic_mask, b_erase)
         if g_all is not None and g_all.shape == taken0.shape:
             taken0 = np.maximum(taken0, g_all)
-        for sel_l, _c in getattr(_flat_graphics, "labels", []):
+        for sel_l in getattr(_flat_graphics, "regions", []):
             if sel_l.shape == taken0.shape:
                 taken0[sel_l] = 255                            # 压着文字的色块（标签）不算插画的一部分
         for ic, sel in find_illustrations(img, mask, taken0):
@@ -2727,6 +3200,17 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
         kept = [ln for ln in kept if not inside(ln) and analyze_line(img, ln, mask)]
     attach_dashes(img, kept, mask)                            # 放在最后：前面可能重建过文字掩膜
     attach_trailing_punct(img, kept, mask)
+    tell("audit")
+    unify_sizes(kept)
+    art = audit_lines(img, kept, mask)                         # 审核：定字体；对不上的艺术字留在图里
+    kept = [ln for ln in kept if ln not in art]
+    if photo_blocks:                                           # 整张照片里面的小图 / 图标：跟着照片走，不单独再抠一份
+        def in_block(ic):
+            cx, cy = ic.box[0] + ic.box[2] / 2, ic.box[1] + ic.box[3] / 2
+            return any(bx <= cx <= bx + bw and by <= cy <= by + bh and tuple(ic.box) != (bx, by, bw, bh)
+                       for bx, by, bw, bh in photo_blocks)
+        pics = [p for p in pics if not in_block(p)]
+        icons = [ic for ic in icons if not in_block(ic)]
     icon_mask = np.maximum(icon_mask, pic_mask)
     icons = pics + icons
     tell("erase")
@@ -2737,7 +3221,7 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     for sel, col in getattr(_flat_graphics, "labels", []):     # 纯色标签上的字：直接用标签的颜色盖掉
         if sel.shape != mask.shape or (icon_mask[sel] > 0).mean() > 0.3:
             continue
-        hole = sel & (cv2.dilate(mask, np.ones((9, 9), np.uint8)) > 0)
+        hole = sel & (cv2.dilate(np.maximum(mask, icon_mask), np.ones((9, 9), np.uint8)) > 0)   # 标签上的字和图标留下的洞一起补
         if not hole.any():
             continue
         # 字几乎占满整个标签时，普通补全会把标签外面的底色"抹"进来。这里把标签外面先换成标签的颜色，
@@ -2748,7 +3232,6 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
         crop[~s_in] = np.clip(col, 0, 255).astype(np.uint8)
         fixed = cv2.inpaint(crop, h_in.astype(np.uint8) * 255, 3, cv2.INPAINT_TELEA)
         clean[ly:ly + lh, lx:lx + lw][h_in] = fixed[h_in]
-    unify_sizes(kept)
     refit_widths(kept)
     detect_italic(kept)
     blocks = group_lines(kept)
