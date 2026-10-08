@@ -323,10 +323,13 @@ def reverify_lines(img_bgr, lines):
                 if not r or r[1] < 0.85:
                     continue
                 cand = r[0]
-                if cand == t0 or not _is_subseq(t0, cand):
+                ref = t0
+                if t0[-1] in "：:；;" and not cand.endswith(t0[-1]) and cand.startswith(t0[:-1]):
+                    ref = t0[:-1]                              # 行尾"一"的前半截被认成了冒号："知行合：" → "知行合一"
+                if cand == t0 or not _is_subseq(ref, cand):
                     continue
                 extra_chars = [c for c in cand]
-                for c in t0:
+                for c in ref:
                     extra_chars.remove(c)
                 if not 1 <= len(extra_chars) <= 2 or not all(("一" <= c <= "鿿") or c.isalnum() for c in extra_chars):
                     continue
@@ -337,8 +340,10 @@ def reverify_lines(img_bgr, lines):
         if len(got) < 2:
             continue
         # 补在哪里：行首不补（行首多出来的多半是破折号、竖条）；行尾补的字要经得起墨迹检查；中间补的要有空位
+        if t0[-1] in "：:；;" and not cand.endswith(t0[-1]) and cand.startswith(t0[:-1]):
+            t0 = t0[:-1]
         k = 0
-        while k < len(t0) and cand[k] == t0[k]:
+        while k < len(t0) and k < len(cand) and cand[k] == t0[k]:
             k += 1
         if k == 0:
             continue
