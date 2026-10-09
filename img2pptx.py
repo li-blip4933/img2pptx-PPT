@@ -1002,7 +1002,7 @@ def audit_lines(img_bgr, lines, full_mask):
         # 大字两种字体都对不上：书法 / 艺术字。小字对不上多半是识别时混进了符号，仍按文字处理
         if os.environ.get("AUDITDBG"):
             print("   audit %-5s fit %.2f contrast %s  %s" % (ln.family, s["fit"], "%.2f" % s["contrast"] if s.get("contrast") is not None else " -- ", ln.text[:16]))
-        if ln.audit < 0.36 and ln.size_px >= 40 and len(ln.text) >= 2:
+        if ln.audit < 0.36 and ln.size_px >= 40 and len(ln.text) >= 2 and not getattr(ln, "manual", False):
             dropped.append(ln)
     # 同字号、同颜色的一批小字（并列的卡片、列表）字体统一：明显的少数派改成多数派
     smalls = [ln for ln in lines if ln.ink and ln.size_px < 28 and getattr(ln, "family", None) and not ln.text.isascii()]
@@ -3677,12 +3677,89 @@ def _manual_element(img_bgr, box, kind, text_mask):
     return Icon(x, y, rgba, kind, tight, 100, "手动调整"), sel, clean_edge
 
 
+def _box_iou(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    iw = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+    ih = max(0.0, min(ay + ah, by + bh) - max(ay, by))
+    inter = iw * ih
+    return inter / max(1e-6, aw * ah + bw * bh - inter)
+
+
+def apply_text_edits(kept, text_edits, mask):
+    """人工改字：按"那行字的框"找到对应的行，换文字或删掉（删掉的行留在底图里，不抹）。返回新的行列表。"""
+    removed = []
+    for e in text_edits:
+        if not e.get("src"):
+            continue
+        src = [float(v) for v in e["src"]]
+        best, bi = 0.0, None
+        for ln in kept:
+            if ln in removed or not ln.ink:
+                continue
+            v = _box_iou(src, (ln.ink[0], ln.ink[1], ln.ink[2] - ln.ink[0], ln.ink[3] - ln.ink[1]))
+            if v > best:
+                best, bi = v, ln
+        if bi is None or best < 0.4:
+            continue
+        text = e.get("text")
+        if text is None or not text.strip():
+            removed.append(bi)
+            continue
+        text = text.strip().replace("\n", "")
+        if text == bi.text:
+            continue
+        if bi.runs and len(bi.runs) > 1 and len(text) == len(bi.text):
+            # 字数没变：保留原来每一段的颜色 / 粗细，只换字
+            nr, k = [], 0
+            for t, c, b, px in bi.runs:
+                nr.append((text[k:k + len(t)], c, b, px))
+                k += len(t)
+            bi.runs = nr
+        elif bi.runs:
+            t, c, b, px = max(bi.runs, key=lambda r: len(r[0]))   # 字数变了：整行用原来占多数的那种样式
+            bi.runs = [(text, c, b, px)]
+        bi.text = text
+        bi.chars = None
+    if not removed:
+        return kept
+    for ln in removed:                                         # 删掉的行：撤掉它的抹字范围，字留在图里
+        if ln.own_mask is not None:
+            mx, my, m = ln.own_mask
+            mask[my:my + m.shape[0], mx:mx + m.shape[1]][m > 0] = 0
+    kept = [ln for ln in kept if ln not in removed]
+    for ln in kept:                                            # 挨着的行被一起撤掉的部分补回来
+        if ln.own_mask is not None:
+            mx, my, m = ln.own_mask
+            sub = mask[my:my + m.shape[0], mx:mx + m.shape[1]]
+            sub[...] = np.maximum(sub, m[:sub.shape[0], :sub.shape[1]])
+    return kept
+
+
+def _manual_fallback(img_bgr, ln):
+    """人工补的字在那块地方量不出笔画（框画在空白处、或者底色太花）：按框的大小给一个默认样式，照样转成文字。"""
+    if not getattr(ln, "manual", False):
+        return False
+    roi = img_bgr[ln.y:ln.y + ln.h, ln.x:ln.x + ln.w].reshape(-1, 3).astype(np.float32)
+    bg = np.median(roi, axis=0) if len(roi) else np.array([255, 255, 255], np.float32)
+    dark = float(bg.mean()) > 128
+    ln.color = (34, 34, 34) if dark else (255, 255, 255)        # 浅底用深色字，深底用白字
+    ln.size_px = max(8.0, 0.78 * ln.h)
+    ln.ink = (ln.x, ln.y, ln.x + ln.w, ln.y + ln.h)
+    ln.baseline = ln.y + 0.88 * ln.h
+    ln.runs = [(ln.text, ln.color, False, ln.size_px)]
+    ln.fit = 0.0
+    return True
+
+
 def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="auto", with_pictures=True, on_stage=None,
-                  ocr=None, edits=None):
+                  ocr=None, edits=None, text_edits=None):
     """on_stage(阶段名, 数据)：每完成一个阶段回调一次，网页界面用它显示真实进度。
     ocr   ：上一次的文字识别结果（process_image.last_ocr），传进来就不用再识别一遍
     edits ：人工调整后"想要的元素清单" [{"box": [x,y,w,h], "kind": "图标"/"图片", "src": 自动识别时的框 或 None}]。
-            src 对得上的自动元素原样保留；清单里没有的自动元素不再抠（留在底图里）；src 为空的按 box 重新抠"""
+            src 对得上的自动元素原样保留；清单里没有的自动元素不再抠（留在底图里）；src 为空的按 box 重新抠
+    text_edits：人工改字 [{"box": [x,y,w,h], "src": 自动识别出的那行字的框 或 None, "text": 新文字 或 None}]，按顺序生效。
+            src 为空 = 补一行漏识别的字（框里原来识别到的字作废）；text 为 None = 这行不转文字，留在图里"""
     """on_stage(阶段名, 数据)：每完成一个阶段回调一次，网页界面用它显示真实进度。"""
     def tell(name, data=None):
         if on_stage:
@@ -3708,9 +3785,17 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     strip_side_bars(img, lines)
     lines = split_wide_gaps(img, lines)
     fix_number_columns(lines)
+    for e in text_edits or []:                                 # 人工补的字：框里原来识别到的行作废，换成这一行
+        if e.get("src") or not e.get("box") or not (e.get("text") or "").strip():
+            continue
+        bx, by, bw, bh = [int(round(v)) for v in e["box"]]
+        lines = [l for l in lines if not (bx <= l.x + l.w / 2 <= bx + bw and by <= l.y + l.h / 2 <= by + bh)]
+        nl = Line(e["text"].strip().replace("\n", ""), bx, by, bw, bh)
+        nl.manual = True
+        lines.append(nl)
     badges, lines = find_badges(img, lines)                    # 序号先分出来：圆圈归图形，里面的字归文字
     mask = np.zeros((H, W), np.uint8)
-    kept = [ln for ln in lines if analyze_line(img, ln, mask)]
+    kept = [ln for ln in lines if analyze_line(img, ln, mask) or _manual_fallback(img, ln)]
     tell("text", [[int(l.ink[0]), int(l.ink[1]), int(l.ink[2] - l.ink[0]), int(l.ink[3] - l.ink[1]), int(round(l.score * 100)), l.text] for l in kept])
     zero = np.zeros((H, W), np.uint8)
     # 先用"全部文字"的掩膜找图标和图片，再决定哪些字属于图片内部
@@ -3842,7 +3927,7 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     pictures = find_picture_regions(img, mask)                 # 贴着画面边缘、没法整张抠出来的照片区域
     free = cv2.dilate(mask, np.ones((5, 5), np.uint8)) == 0
     def inside(ln):
-        if ln.badge:
+        if ln.badge or getattr(ln, "manual", False):          # 人工补的字一定转成文字
             return False
         cx, cy = int((ln.ink[0] + ln.ink[2]) / 2), int((ln.ink[1] + ln.ink[3]) / 2)
         if any(sel[min(H - 1, cy), min(W - 1, cx)] for sel in pic_sel):
@@ -3853,7 +3938,7 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     skipped = [ln for ln in kept if inside(ln)]
     if skipped:
         mask = np.zeros((H, W), np.uint8)
-        kept = [ln for ln in kept if not inside(ln) and analyze_line(img, ln, mask)]
+        kept = [ln for ln in kept if not inside(ln) and (analyze_line(img, ln, mask) or _manual_fallback(img, ln))]
     attach_dashes(img, kept, mask)                            # 放在最后：前面可能重建过文字掩膜
     attach_trailing_punct(img, kept, mask)
     tell("audit")
@@ -3862,6 +3947,8 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     harmonize_bold([ln for ln in kept if ln not in art])
     harmonize_accents([ln for ln in kept if ln not in art])                         # 审核：定字体；对不上的艺术字留在图里
     kept = [ln for ln in kept if ln not in art]
+    if text_edits:
+        kept = apply_text_edits(kept, text_edits, mask)
     if photo_blocks:                                           # 整张照片里面的小图 / 图标：跟着照片走，不单独再抠一份
         def in_block(ic):
             cx, cy = ic.box[0] + ic.box[2] / 2, ic.box[1] + ic.box[3] / 2

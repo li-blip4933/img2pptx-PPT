@@ -159,27 +159,37 @@
 
   /* ---------- 识别过程 ---------- */
   .live { margin-top: 16px; background: var(--card); border: 1px solid var(--line); }
-  /* 手动调整 */
-  .stage.editing > .box.i, .stage.editing > .box.p, .stage.editing > .box.r { display: none; }
-  .stage.editing > .box.t { pointer-events: none; opacity: .35; }
+  /* 修改模式：所有框都能点；点中后旁边弹出一个小面板 */
+  .stage.editing > .box { display: none; }
   .edit-layer { position: absolute; inset: 0; display: none; cursor: crosshair; touch-action: none; }
   .stage.editing .edit-layer { display: block; }
-  .ebox { position: absolute; border: 2px solid var(--c); background: color-mix(in srgb, var(--c) 14%, transparent); cursor: move; box-sizing: border-box; }
-  .ebox.i { --c: var(--icon-layer); } .ebox.p { --c: var(--pic-layer); }
-  .ebox.r { --c: #7A8497; border-style: dashed; border-width: 1.5px; background: transparent; cursor: copy; }
-  .ebox.changed { border-style: dashed; }
+  .ebox { position: absolute; border: 2px solid var(--c); background: color-mix(in srgb, var(--c) 10%, transparent); cursor: pointer; box-sizing: border-box; }
+  .ebox:hover { background: color-mix(in srgb, var(--c) 24%, transparent); }
+  .ebox.t { --c: var(--text-layer); } .ebox.i { --c: var(--icon-layer); cursor: move; } .ebox.p { --c: var(--pic-layer); cursor: move; }
+  .ebox.r { --c: #7A8497; border-style: dashed; border-width: 1.5px; background: transparent; }
+  .ebox.gone { --c: #7A8497; border-style: dotted; background: repeating-linear-gradient(45deg, transparent 0 6px, rgba(122,132,151,.18) 6px 8px); }
+  .ebox.changed { box-shadow: inset 0 0 0 1px #fff; }
+  .ebox.changed::after { content: "改"; position: absolute; right: -2px; top: -2px; transform: translateY(-100%); background: var(--c); color: #fff; font: 600 10px/1 var(--sans); padding: 3px 4px; }
   .ebox.sel { background: color-mix(in srgb, var(--c) 26%, transparent); box-shadow: 0 0 0 2px #fff, 0 0 0 4px var(--c); z-index: 5; }
   .ebox .h { position: absolute; width: 12px; height: 12px; background: #fff; border: 2px solid var(--c); display: none; }
-  .ebox.sel .h { display: block; }
+  .ebox.sel.i .h, .ebox.sel.p .h, .ebox.sel.n .h { display: block; }
   .ebox .h.nw { left: -7px; top: -7px; cursor: nwse-resize; } .ebox .h.ne { right: -7px; top: -7px; cursor: nesw-resize; }
   .ebox .h.sw { left: -7px; bottom: -7px; cursor: nesw-resize; } .ebox .h.se { right: -7px; bottom: -7px; cursor: nwse-resize; }
-  .ebox .lab { position: absolute; left: -2px; bottom: 100%; background: var(--c); color: #fff; font: 600 10px/1 var(--mono); padding: 3px 5px; white-space: nowrap; }
-  .edit-bar { display: none; align-items: center; gap: 8px; flex-wrap: wrap; padding: 10px 16px; border-top: 1px solid var(--line); font-size: 13px; line-height: 1.5; }
+  .pop-panel { position: absolute; z-index: 9; background: var(--card); border: 1.5px solid var(--ink); box-shadow: 0 10px 28px -8px rgba(19,26,43,.45);
+               padding: 10px; line-height: 1.4; font-size: 13px; width: 300px; max-width: calc(100% - 8px); cursor: default; }
+  .pop-panel .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .pop-panel .row + .row { margin-top: 8px; }
+  .pop-panel button { font: inherit; font-size: 13px; padding: 4px 10px; border: 1.5px solid var(--ink); background: var(--card); color: var(--ink); cursor: pointer; }
+  .pop-panel button[aria-pressed="true"] { background: var(--ink); color: #fff; }
+  .pop-panel button.danger { border-color: #C2410C; color: #C2410C; margin-left: auto; }
+  .pop-panel textarea { width: 100%; box-sizing: border-box; font: 15px/1.5 var(--sans); padding: 6px 8px; border: 1.5px solid var(--line); resize: vertical; min-height: 40px; }
+  .pop-panel textarea:focus { outline: none; border-color: var(--text-layer); }
+  .pop-panel .k { color: var(--soft); font-size: 12px; }
+  .edit-bar { display: none; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 16px; border-top: 1px solid var(--line); font-size: 13px; line-height: 1.5; color: var(--soft); }
   .page.editing .edit-bar { display: flex; }
-  .edit-bar button { font: inherit; font-size: 13px; padding: 5px 12px; border: 1.5px solid var(--ink); background: var(--card); color: var(--ink); cursor: pointer; }
-  .edit-bar button[aria-pressed="true"] { background: var(--ink); color: #fff; }
-  .edit-bar button:disabled { opacity: .4; cursor: not-allowed; }
-  .edit-bar .tip { color: var(--soft); flex-basis: 100%; }
+  .edit-bar a { color: var(--ink); }
+  .edit-bar .apply { margin-left: auto; font: inherit; font-size: 13px; font-weight: 600; padding: 6px 14px; border: none; background: var(--ink); color: #fff; cursor: pointer; }
+  .edit-bar .apply:disabled { opacity: .35; cursor: not-allowed; }
   .live .stage { overflow: hidden; }
   .scan { position: absolute; left: 0; right: 0; height: 26%; top: -26%; pointer-events: none; z-index: 4;
           background: linear-gradient(to bottom, transparent, color-mix(in srgb, var(--c) 10%, transparent) 55%, color-mix(in srgb, var(--c) 34%, transparent));
@@ -450,70 +460,121 @@ async function waitJob(id, total) {
   }
 }
 
-// ---------- 手动调整 ----------
-// 每页一份"想要的元素清单"。src 是自动识别时的框：没动过的元素带着它，后台就原样保留；
-// 动过 / 新画的 src 为空，后台按新的框重新抠；从清单里删掉的不再抠，留在底图里。
-let editors = [];          // 每页一个 { els, rej, dirty, reset }
+// ---------- 修改（人工调整） ----------
+// 每页记一份修改：图形是"想要的元素清单"（src 是自动识别时的框，没动过的带着它，后台原样保留；
+// 动过 / 新画的 src 为空，后台按新框重新抠；清单里删掉的不再抠）；文字是逐条的改字记录。
+let editors = [];
 let currentJob = null;
 function refreshRedo() {
-  const n = editors.filter(e => e.dirty || e.reset).length;
+  const n = editors.filter(e => e && (e.dirty || e.reset)).length;
   $('redo').hidden = n === 0;
   $('redo').textContent = n > 1 ? `按修改重新生成（${n} 页）` : '按修改重新生成';
+  editors.forEach(e => e && e.applyBtn && (e.applyBtn.disabled = !(e.dirty || e.reset)));
 }
 function makeEditor(p, i, sec, stage) {
-  const ed = { dirty: false, reset: false, sel: null, newKind: 'icon',
+  const ed = { dirty: false, reset: false, sel: null, gfxDirty: false,
     els: [...p.icon.map(r => ({ box: r.slice(0, 4), kind: 'icon', src: r[6] ? null : r.slice(0, 4) })),
           ...p.picture.map(r => ({ box: r.slice(0, 4), kind: 'picture', src: r[6] ? null : r.slice(0, 4) }))],
-    rej: p.rejected.map(r => r.slice(0, 4)) };
+    rej: p.rejected.map(r => r.slice(0, 4)),
+    texts: (p.lines || []).map(r => ({ box: r.slice(0, 4), text: r[4], orig: r[4], src: r.slice(0, 4), del: false })) };
   editors[i] = ed;
   const layer = document.createElement('div'); layer.className = 'edit-layer'; stage.append(layer);
   const bar = document.createElement('div'); bar.className = 'edit-bar';
-  const mk = (text, fn) => { const b = document.createElement('button'); b.type = 'button'; b.textContent = text; b.onclick = fn; bar.append(b); return b; };
-  const span = t => { const s = document.createElement('span'); s.textContent = t; bar.append(s); return s; };
-  span('画新框：');
-  const bIcon = mk('图标', () => { ed.newKind = 'icon'; draw(); });
-  const bPic = mk('图片', () => { ed.newKind = 'picture'; draw(); });
-  span('　选中的框：');
-  const bDel = mk('删除（留在底图）', () => { if (ed.sel) { ed.els.splice(ed.els.indexOf(ed.sel), 1); ed.sel = null; touch(); } });
-  const bSwap = mk('改成图片', () => { if (ed.sel) { ed.sel.kind = ed.sel.kind === 'icon' ? 'picture' : 'icon'; ed.sel.src = null; touch(); } });
-  span('　');
-  mk('恢复自动识别', () => { ed.reset = true; ed.dirty = false; refreshRedo(); tip.textContent = '这一页会按自动识别的结果重新生成。点上方"按修改重新生成"生效。'; });
-  const tip = document.createElement('span'); tip.className = 'tip'; bar.append(tip);
-  const TIP = '拖动框可以移动，选中后拖四个角改大小；在空白处按住拖动画一个新框；点灰色虚线框把它抠出来。图标框里的文字仍然是文字，图片框里的文字跟着图片走。改完点上方"按修改重新生成"。';
-  tip.textContent = TIP;
+  bar.innerHTML = '<span>点一下框就能改：文字框改字或删掉，图标 / 图片框拖动、拉角改大小。漏掉的字或图，在空白处拖一个框补上。</span>';
+  const resetA = document.createElement('a'); resetA.href = '#'; resetA.textContent = '撤销这一页的全部修改';
+  resetA.onclick = ev => { ev.preventDefault(); ed.reset = true; ed.dirty = false; ed.sel = null; refreshRedo(); bar.querySelector('span').textContent = '这一页会恢复成自动识别的结果。'; draw(); };
+  const apply = document.createElement('button'); apply.className = 'apply'; apply.type = 'button'; apply.textContent = '应用修改'; apply.disabled = true;
+  apply.onclick = () => $('redo').click();
+  ed.applyBtn = apply;
+  bar.append(resetA, apply);
   sec.append(bar);
-  const touch = () => { ed.dirty = true; ed.reset = false; tip.textContent = TIP; refreshRedo(); draw(); };
-  const pct = (b) => `left:${b[0] / p.w * 100}%;top:${b[1] / p.h * 100}%;width:${b[2] / p.w * 100}%;height:${b[3] / p.h * 100}%`;
+  const touch = (gfx) => { ed.dirty = true; ed.reset = false; if (gfx) ed.gfxDirty = true; refreshRedo(); draw(); };
+  const pct = b => `left:${b[0] / p.w * 100}%;top:${b[1] / p.h * 100}%;width:${b[2] / p.w * 100}%;height:${b[3] / p.h * 100}%`;
+  const handles = d => { for (const c of ['nw', 'ne', 'sw', 'se']) { const h = document.createElement('i'); h.className = 'h ' + c; h.dataset.c = c; d.append(h); } };
+
+  // 选中后弹出的小面板
+  function panel(item) {
+    const pn = document.createElement('div'); pn.className = 'pop-panel';
+    pn.addEventListener('pointerdown', e => e.stopPropagation());
+    const b = item.box, below = (b[1] + b[3]) / p.h < 0.72;
+    pn.style.left = `${Math.min(b[0] / p.w * 100, 70)}%`;
+    if (below) pn.style.top = `calc(${(b[1] + b[3]) / p.h * 100}% + 10px)`; else pn.style.bottom = `calc(${(1 - b[1] / p.h) * 100}% + 10px)`;
+    const row = () => { const r = document.createElement('div'); r.className = 'row'; pn.append(r); return r; };
+    const btn = (r, text, fn, cls) => { const x = document.createElement('button'); x.type = 'button'; x.textContent = text; if (cls) x.className = cls; x.onclick = fn; r.append(x); return x; };
+    if (item.type === 'text') {
+      const t = item.t;
+      const k = document.createElement('div'); k.className = 'k'; k.textContent = t.src ? (t.del ? '这行不转成文字，留在图里' : '识别出的文字（直接改，回车确定）') : '补一行漏识别的字';
+      pn.append(k);
+      const ta = document.createElement('textarea'); ta.rows = 2; ta.value = t.text; pn.append(ta);
+      ta.addEventListener('input', () => { t.text = ta.value; t.del = false; ed.dirty = true; ed.reset = false; refreshRedo(); });
+      ta.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ed.sel = null; draw(); } if (e.key === 'Escape') { ed.sel = null; draw(); } });
+      const r = row();
+      btn(r, '完成', () => { ed.sel = null; draw(); });
+      if (t.src) btn(r, t.del ? '恢复成文字' : '不转文字（留在图里）', () => { t.del = !t.del; if (!t.del && !t.text) t.text = t.orig; ed.sel = null; touch(); }, 'danger');
+      else btn(r, '删除这个框', () => { ed.texts.splice(ed.texts.indexOf(t), 1); ed.sel = null; touch(); }, 'danger');
+      setTimeout(() => { ta.focus(); ta.select(); }, 0);
+    } else if (item.type === 'el') {
+      const el = item.el, r = row();
+      const bi = btn(r, '图标', () => { if (el.kind !== 'icon') { el.kind = 'icon'; el.src = null; touch(true); } });
+      const bp = btn(r, '图片', () => { if (el.kind !== 'picture') { el.kind = 'picture'; el.src = null; touch(true); } });
+      bi.setAttribute('aria-pressed', el.kind === 'icon'); bp.setAttribute('aria-pressed', el.kind === 'picture');
+      btn(r, '删除（留在底图）', () => { ed.els.splice(ed.els.indexOf(el), 1); ed.sel = null; touch(true); }, 'danger');
+      const k = document.createElement('div'); k.className = 'k row'; k.textContent = '图标：小图案；图片：照片、插画、整块图（里面的字跟着图走）'; pn.append(k);
+    } else if (item.type === 'new') {
+      const k = document.createElement('div'); k.className = 'k'; k.textContent = '这个框里是什么？'; pn.append(k);
+      const r = row();
+      btn(r, '文字', () => { const t = { box: item.box, text: '', orig: '', src: null, del: false }; ed.texts.push(t); ed.pending = null; ed.sel = { type: 'text', t, box: t.box }; draw(); });
+      btn(r, '图标', () => { const el = { box: item.box, kind: 'icon', src: null }; ed.els.push(el); ed.pending = null; ed.sel = { type: 'el', el, box: el.box }; touch(true); });
+      btn(r, '图片', () => { const el = { box: item.box, kind: 'picture', src: null }; ed.els.push(el); ed.pending = null; ed.sel = { type: 'el', el, box: el.box }; touch(true); });
+      btn(r, '取消', () => { ed.pending = null; ed.sel = null; draw(); }, 'danger');
+    }
+    return pn;
+  }
+
   function draw() {
     layer.innerHTML = '';
-    bIcon.setAttribute('aria-pressed', ed.newKind === 'icon'); bPic.setAttribute('aria-pressed', ed.newKind === 'picture');
-    bDel.disabled = bSwap.disabled = !ed.sel;
-    bSwap.textContent = ed.sel && ed.sel.kind === 'picture' ? '改成图标' : '改成图片';
+    const isSel = obj => ed.sel && (ed.sel.t === obj || ed.sel.el === obj);
+    // 灰色虚线：分数不够没抠出来的候选，点一下就抠
     ed.rej.forEach((b, n) => {
-      const d = document.createElement('div'); d.className = 'ebox r'; d.style.cssText = pct(b); d.title = '点一下把它抠出来';
+      const d = document.createElement('div'); d.className = 'ebox r'; d.style.cssText = pct(b); d.title = '没抠出来的候选：点一下把它抠成图标';
       d.addEventListener('pointerdown', e => { e.stopPropagation(); const el = { box: b.slice(), kind: 'icon', src: null };
-        ed.rej.splice(n, 1); ed.els.push(el); ed.sel = el; touch(); });
+        ed.rej.splice(n, 1); ed.els.push(el); ed.sel = { type: 'el', el, box: el.box }; touch(true); });
       layer.append(d);
     });
+    for (const t of ed.texts) {
+      const d = document.createElement('div');
+      const changed = !t.src || t.del || t.text !== t.orig;
+      d.className = 'ebox t' + (t.del ? ' gone' : '') + (changed ? ' changed' : '') + (isSel(t) ? ' sel' : '') + (t.src ? '' : ' n');
+      d.style.cssText = pct(t.box); d.title = t.del ? '（不转文字）' : t.text;
+      if (!t.src) handles(d);
+      d.addEventListener('pointerdown', e => { e.stopPropagation(); e.preventDefault(); ed.sel = { type: 'text', t, box: t.box };
+        if (!t.src) drag(e, t, e.target.dataset.c || 'move'); else draw(); });
+      layer.append(d);
+    }
     for (const el of ed.els) {
       const d = document.createElement('div');
-      d.className = 'ebox ' + (el.kind === 'icon' ? 'i' : 'p') + (el.src ? '' : ' changed') + (el === ed.sel ? ' sel' : '');
-      d.style.cssText = pct(el.box);
-      const lab = document.createElement('b'); lab.className = 'lab'; lab.textContent = (el.kind === 'icon' ? '图标' : '图片') + (el.src ? '' : ' · 手动');
-      d.append(lab);
-      for (const c of ['nw', 'ne', 'sw', 'se']) { const h = document.createElement('i'); h.className = 'h ' + c; h.dataset.c = c; d.append(h); }
-      d.addEventListener('pointerdown', e => { e.stopPropagation(); e.preventDefault(); ed.sel = el; drag(e, el, e.target.dataset.c || 'move'); });
+      d.className = 'ebox ' + (el.kind === 'icon' ? 'i' : 'p') + (el.src ? '' : ' changed') + (isSel(el) ? ' sel' : '');
+      d.style.cssText = pct(el.box); d.title = el.kind === 'icon' ? '图标' : '图片';
+      handles(d);
+      d.addEventListener('pointerdown', e => { e.stopPropagation(); e.preventDefault(); ed.sel = { type: 'el', el, box: el.box }; drag(e, el, e.target.dataset.c || 'move'); });
       layer.append(d);
+    }
+    if (ed.pending) {
+      const d = document.createElement('div'); d.className = 'ebox r sel'; d.style.cssText = pct(ed.pending.box); layer.append(d);
+      layer.append(panel(ed.pending));
+    } else if (ed.sel) {
+      ed.sel.box = ed.sel.t ? ed.sel.t.box : ed.sel.el.box;
+      layer.append(panel(ed.sel));
     }
   }
   // 拖动：move 移动整个框，nw/ne/sw/se 拖一个角，new 画新框
-  function drag(e, el, mode) {
-    const k = p.w / layer.clientWidth, sx = e.clientX, sy = e.clientY, b0 = el.box.slice();
+  function drag(e, obj, mode) {
+    const k = p.w / layer.clientWidth, sx = e.clientX, sy = e.clientY, b0 = obj.box.slice();
     let moved = false;
-    draw();
+    if (mode !== 'new') draw();
     const onMove = ev => {
       const dx = (ev.clientX - sx) * k, dy = (ev.clientY - sy) * k;
-      if (Math.abs(dx) + Math.abs(dy) < 2 && !moved) return;
+      if (Math.abs(dx) + Math.abs(dy) < 3 && !moved) return;
       moved = true;
       let [x, y, w, h] = b0;
       if (mode === 'move') { x += dx; y += dy; }
@@ -524,14 +585,19 @@ function makeEditor(p, i, sec, stage) {
       }
       w = Math.max(4, Math.min(w, p.w)); h = Math.max(4, Math.min(h, p.h));
       x = Math.max(0, Math.min(x, p.w - w)); y = Math.max(0, Math.min(y, p.h - h));
-      el.box = [x, y, w, h].map(Math.round);
-      const d = [...layer.children].find(c => c.classList.contains('sel'));
-      if (d) d.style.cssText = pct(el.box);
+      obj.box = [x, y, w, h].map(Math.round);
+      if (mode === 'new') { ed.pending = null; layer.querySelectorAll('.pop-panel').forEach(n => n.remove()); }
+      const d = mode === 'new' ? layer.querySelector('.ebox.drawing') : layer.querySelector('.ebox.sel');
+      if (d) d.style.cssText = pct(obj.box);
+      else if (mode === 'new') { const nd = document.createElement('div'); nd.className = 'ebox r sel drawing'; nd.style.cssText = pct(obj.box); layer.append(nd); }
     };
     const onUp = () => {
       window.removeEventListener('pointermove', onMove); window.removeEventListener('pointerup', onUp);
-      if (mode === 'new' && (el.box[2] < 8 || el.box[3] < 8)) { ed.els.splice(ed.els.indexOf(el), 1); ed.sel = null; draw(); return; }   // 只是点了一下空白：取消选中
-      if (moved || mode === 'new') { el.src = null; touch(); } else draw();
+      if (mode === 'new') {
+        if (!moved || obj.box[2] < 8 || obj.box[3] < 8) { ed.sel = null; ed.pending = null; draw(); return; }   // 只是点了一下空白：取消选中
+        ed.sel = null; ed.pending = { type: 'new', box: obj.box }; draw(); return;
+      }
+      if (moved) { if ('kind' in obj) obj.src = null; touch('kind' in obj); } else draw();
     };
     window.addEventListener('pointermove', onMove); window.addEventListener('pointerup', onUp);
   }
@@ -539,25 +605,41 @@ function makeEditor(p, i, sec, stage) {
     if (e.target !== layer) return;
     e.preventDefault();
     const r = layer.getBoundingClientRect(), k = p.w / r.width;
-    const el = { box: [Math.round((e.clientX - r.left) * k), Math.round((e.clientY - r.top) * k), 1, 1], kind: ed.newKind, src: null };
-    ed.els.push(el); ed.sel = el; drag(e, el, 'new');
+    ed.sel = null; ed.pending = null; draw();
+    drag(e, { box: [Math.round((e.clientX - r.left) * k), Math.round((e.clientY - r.top) * k), 1, 1] }, 'new');
   });
-  ed.remove = () => { if (ed.sel) bDel.onclick(); };
+  ed.remove = () => {
+    if (!ed.sel) return;
+    if (ed.sel.type === 'el') { ed.els.splice(ed.els.indexOf(ed.sel.el), 1); ed.sel = null; touch(true); }
+    else if (ed.sel.type === 'text' && ed.sel.t.src) { ed.sel.t.del = true; ed.sel = null; touch(); }
+    else if (ed.sel.type === 'text') { ed.texts.splice(ed.texts.indexOf(ed.sel.t), 1); ed.sel = null; touch(); }
+  };
   ed.active = () => sec.classList.contains('editing');
+  ed.payload = () => {
+    if (ed.reset) return null;
+    const texts = [];
+    for (const t of ed.texts) {
+      if (t.src && t.del) texts.push({ src: t.src, text: null });
+      else if (t.src && t.text.trim() !== t.orig) texts.push({ src: t.src, text: t.text.trim() || null });
+      else if (!t.src && t.text.trim()) texts.push({ box: t.box, text: t.text.trim() });
+    }
+    const out = { texts };
+    if (ed.gfxDirty) out.elements = ed.els.map(el => ({ box: el.box, kind: el.kind === 'picture' ? '图片' : '图标', src: el.src }));
+    return out;
+  };
   draw();
   return ed;
 }
 document.addEventListener('keydown', e => {
   if (e.key !== 'Delete' && e.key !== 'Backspace') return;
+  if (['TEXTAREA', 'INPUT'].includes(document.activeElement.tagName)) return;   // 正在打字时不删框
   const ed = editors.find(x => x && x.active() && x.sel);
   if (ed) { e.preventDefault(); ed.remove(); }
 });
 $('redo').addEventListener('click', async () => {
   const job = currentJob, pages = {};
-  editors.forEach((ed, i) => {
-    if (ed.reset) pages[i] = null;
-    else if (ed.dirty) pages[i] = ed.els.map(el => ({ box: el.box, kind: el.kind === 'picture' ? '图片' : '图标', src: el.src }));
-  });
+  editors.forEach((ed, i) => { if (ed && (ed.reset || ed.dirty)) pages[i] = ed.payload(); });
+  if (!Object.keys(pages).length) return;
   $('result').hidden = true; $('run').hidden = false;
   $('what').textContent = '正在按你的修改重新生成…'; $('fill').style.width = '8%';
   $('runHint').textContent = '只重新处理改过的页，文字不用重新识别，会比第一次快。';
@@ -611,8 +693,8 @@ function showResult(job) {
     base.onclick = () => { const on = base.getAttribute('aria-pressed') !== 'true'; base.setAttribute('aria-pressed', on);
                            img.src = `/api/jobs/${job.id}/image/${i}/${on ? 'clean' : 'orig'}`; };
     chips.append(base);
-    const edit = document.createElement('button'); edit.className = 'chip base'; edit.setAttribute('aria-pressed', 'false'); edit.textContent = '手动调整';
-    edit.title = '识别得不对的框，可以自己改大小、删除或补画';
+    const edit = document.createElement('button'); edit.className = 'chip base'; edit.setAttribute('aria-pressed', 'false'); edit.textContent = '修改';
+    edit.title = '改错字、删掉不该转的字、补上漏掉的字；调整图标和图片的框';
     edit.onclick = () => { const on = edit.getAttribute('aria-pressed') !== 'true'; edit.setAttribute('aria-pressed', on);
                            stage.classList.toggle('editing', on); sec.classList.toggle('editing', on); };
     chips.append(edit);

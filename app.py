@@ -56,6 +56,7 @@ def run_job(job, only=None):
             job.setdefault("results", [None] * n)
             job.setdefault("ocr", [None] * n)
             job.setdefault("edits", [None] * n)
+            job.setdefault("textedits", [[] for _ in range(n)])
             job.setdefault("rejected", [[] for _ in range(n)])
             for i, path in enumerate(job["files"]):
                 if only is not None and i not in only and job["results"][i] is not None:
@@ -73,14 +74,15 @@ def run_job(job, only=None):
                         path, "auto", "chi_sim+eng",
                         with_icons=job["opts"]["icons"], with_pictures=job["opts"]["pictures"],
                         inpaint=job["opts"]["inpaint"], on_stage=on_stage,
-                        ocr=job["ocr"][i], edits=job["edits"][i])
+                        ocr=job["ocr"][i], edits=job["edits"][i], text_edits=job["textedits"][i])
                 except Exception:
                     # 抠图那一步碰到没见过的版面出错时，不让整批失败：这一页退回"只转文字"，其余照常
                     traceback.print_exc()
                     job["warnings"].append(f"第 {i + 1} 页（{job['names'][i]}）识别图标/图片时出错，这一页只转换了文字")
                     job["results"][i] = core.process_image(
                         path, "auto", "chi_sim+eng", with_icons=False, with_pictures=False,
-                        inpaint=job["opts"]["inpaint"], on_stage=on_stage, ocr=job["ocr"][i])
+                        inpaint=job["opts"]["inpaint"], on_stage=on_stage, ocr=job["ocr"][i],
+                        text_edits=job["textedits"][i])
                 job["ocr"][i] = core.process_image.last_ocr      # 文字识别最费时间，留着，人工调整后重新生成时不用再做
                 job["rejected"][i] = list(getattr(core.process_image, "last_rejected", []))
                 job["done"] = i + 1
@@ -104,13 +106,16 @@ def run_job(job, only=None):
                                   int(round(100 * min(l.score for l in b.lines))), "\n".join(l.text for l in b.lines)])
                 def row(ic):                                    # 最后一项：是不是人工调整出来的
                     return [int(v) for v in ic.box] + [ic.score, ic.why, 1 if ic.why.startswith("手动") else 0]
+                lines = [[int(l.ink[0]), int(l.ink[1]), int(l.ink[2] - l.ink[0]), int(l.ink[3] - l.ink[1]), l.text,
+                          1 if getattr(l, "manual", False) else 0]
+                         for b in blocks for l in b.lines if l.ink]  # 逐行的框和文字：手动改字用
                 pages.append({
                     "name": job["names"][i], "w": W, "h": H,
-                    "text": texts,
+                    "text": texts, "lines": lines,
                     "icon": [row(ic) for ic in icons if ic.kind == "图标"],
                     "picture": [row(ic) for ic in icons if ic.kind == "图片"],
                     "rejected": [row(ic) for ic in job["rejected"][i]],
-                    "edited": job["edits"][i] is not None,
+                    "edited": job["edits"][i] is not None or bool(job["textedits"][i]),
                 })
             job["pages"] = pages
             stem = os.path.splitext(job["names"][0])[0]
@@ -269,15 +274,27 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 req = json.loads(body.decode("utf-8"))["pages"]
                 only = []
-                for k, lst in req.items():
+                for k, v in req.items():
                     i = int(k)
                     if not 0 <= i < len(job["files"]):
                         raise ValueError("页码不对")
+                    if v is None:                               # 恢复自动识别：图形和文字的修改都清掉
+                        job["edits"][i], job["textedits"][i] = None, []
+                        only.append(i)
+                        continue
+                    if isinstance(v, list):                     # 旧格式：只有图形清单
+                        v = {"elements": v}
+                    lst = v.get("elements")
                     if lst is not None:
-                        lst = [{"box": [float(v) for v in e["box"]][:4],
-                                "kind": "图片" if e.get("kind") == "图片" else "图标",
-                                "src": [int(v) for v in e["src"]][:4] if e.get("src") else None} for e in lst]
-                    job["edits"][i] = lst
+                        job["edits"][i] = [{"box": [float(x) for x in e["box"]][:4],
+                                            "kind": "图片" if e.get("kind") == "图片" else "图标",
+                                            "src": [int(x) for x in e["src"]][:4] if e.get("src") else None} for e in lst]
+                    for e in v.get("texts") or []:             # 改字：累加在之前的修改后面，按顺序生效
+                        t = e.get("text")
+                        job["textedits"][i].append({
+                            "box": [float(x) for x in e["box"]][:4] if e.get("box") else None,
+                            "src": [float(x) for x in e["src"]][:4] if e.get("src") else None,
+                            "text": None if t is None else str(t)[:500]})
                     only.append(i)
             except Exception as e:
                 return self.send_json({"error": f"调整内容格式不对：{e}"}, 400)
