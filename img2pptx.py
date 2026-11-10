@@ -41,6 +41,7 @@ from pptx.oxml.ns import qn
 from pptx.util import Emu, Pt
 
 from arrow_graphics import detect_graphic_arrows
+import learning
 
 SLIDE_W_EMU = 12192000          # 13.333 英寸，标准 16:9 宽度
 EMU_PER_PT = 12700
@@ -4585,6 +4586,160 @@ def _manual_fallback(img_bgr, ln):
     return True
 
 
+# ----------------------------------------------------------------------------
+# 多页缩略图拼图：拆成单页
+# ----------------------------------------------------------------------------
+def _sheet_segments(is_gap, min_gap, min_len):
+    n = len(is_gap)
+    cuts, i = [0], 0
+    while i < n:
+        if is_gap[i]:
+            j = i
+            while j < n and is_gap[j]:
+                j += 1
+            if j - i >= min_gap or i == 0 or j == n:
+                cuts += [i, j]
+            i = j
+        else:
+            i += 1
+    cuts.append(n)
+    segs = [(cuts[k], cuts[k + 1]) for k in range(0, len(cuts) - 1, 2)]
+    return [(a, b) for a, b in segs if b - a >= min_len]
+
+
+def _sheet_split_band(pure_band, h):
+    """一行缩略图横向切成几页：缩略图等宽、间距相同。试 1–8 页，切口要落在"几乎是空白"的竖缝上。"""
+    cs = pure_band.mean(axis=0)
+    xs = np.where(cs < 0.995)[0]
+    if not len(xs):
+        return []
+    a, b = int(xs[0]), int(xs[-1]) + 1
+    best = None
+    for k in range(1, 9):
+        w = (b - a) / k
+        if not 1.15 <= w / h <= 2.2:
+            continue
+        cuts, ok, score = [a], True, []
+        for i in range(1, k):
+            c = int(a + i * w)
+            win = max(3, int(0.04 * w))
+            lo, hi = max(a, c - win), min(b, c + win)
+            j = lo + int(np.argmax(cs[lo:hi]))
+            if cs[j] < 0.55:
+                ok = False
+                break
+            score.append(cs[j])
+            cuts.append(j)
+        if not ok:
+            continue
+        cuts.append(b)
+        s = min(score) if score else 0.5
+        if best is None or k > best[0] and s >= 0.55:
+            best = (k, cuts)
+    if best is None:
+        return []
+    cuts = best[1]
+    return [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)]
+
+
+def find_sheet_panels(im):
+    """一张图里拼着好几页幻灯片（ChatGPT 常一次出一整套缩略图）：找出每一页的矩形，按阅读顺序排好。
+    先按纯背景的横缝切成几行，每行再按等宽的竖缝切成几页。只是普通的一页时返回 []。"""
+    H, W = im.shape[:2]
+    g = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    bgv = float(np.median(np.concatenate([g[0], g[-1], g[:, 0], g[:, -1]])))
+    if bgv < 200:
+        return []                                       # 缩略图拼图的底几乎都是白的
+    pure = np.abs(g - bgv) < 10
+    rows = _sheet_segments(pure.mean(axis=1) >= 0.995, 3, int(0.08 * H))
+    if len(rows) < 2:
+        return []
+    panels = []
+    for y0, y1 in rows:
+        for x0, x1 in _sheet_split_band(pure[y0:y1], y1 - y0):
+            sub = pure[y0:y1, x0:x1]
+            ys = np.where(sub.mean(axis=1) < 0.995)[0]
+            xs = np.where(sub.mean(axis=0) < 0.995)[0]
+            if len(ys) and len(xs):
+                panels.append((x0 + int(xs[0]), y0 + int(ys[0]), int(xs[-1] - xs[0] + 1), int(ys[-1] - ys[0] + 1)))
+    if len(panels) < 2:
+        return []
+    ar = [p[2] / p[3] for p in panels]
+    if max(ar) > 1.25 * min(ar) or sum(p[2] * p[3] for p in panels) < 0.4 * W * H:
+        return []
+    return panels
+
+def split_contact_sheet(img_bgr, target_w=1600):
+    """把一张"多页缩略图拼图"拆成单页，每页放大到约 target_w 宽（小字放大后识别更准）。不是拼图时返回 []。"""
+    out = []
+    for x, y, w, h in find_sheet_panels(img_bgr):
+        crop = img_bgr[y:y + h, x:x + w]
+        k = min(4.0, max(1.0, target_w / float(w)))
+        if k > 1.05:
+            crop = cv2.resize(crop, None, fx=k, fy=k, interpolation=cv2.INTER_CUBIC)
+        out.append(crop)
+    return out
+
+
+def _context_busy(busy, text_mask, box):
+    """框外面一圈（1.2 倍边长）有多"花"：纹理多的像素占多少（文字不算）。
+    卡片上的图标外面是平的底色；插画场景里的碎块外面还是插画。"""
+    H, W = busy.shape
+    x, y, w, h = [int(v) for v in box]
+    s = max(w, h)
+    pad = int(1.2 * s) + 10
+    X0, Y0, X1, Y1 = max(0, x - pad), max(0, y - pad), min(W, x + w + pad), min(H, y + h + pad)
+    valid = text_mask[Y0:Y1, X0:X1] == 0
+    valid[max(0, y - Y0):y - Y0 + h, max(0, x - X0):x - X0 + w] = False
+    sub = busy[Y0:Y1, X0:X1]
+    return float(sub[valid].mean()) if valid.any() else 0.0
+
+
+def drop_scene_fragments(img_bgr, icons, text_mask, keep_ids=()):
+    """大插画（港口、轮船、地球、厂房）和背景融在一起时，规则会把其中的一个集装箱、一台吊车、一块地图单独抠成"图标"。
+    这些碎块留在底图里才对：插画保持完整。判断依据（用真实页面逐个标注后定的）：
+      · 太小：最短边不到页面宽度的 2%
+      · 周围很花（插画里）而且分数不是满分
+      · 特别宽的长条、或者很大但分数低：多半是插画被切下来的一截
+    返回 (留下的, 去掉的)。keep_ids：不参与判断的（序号圆圈等）。"""
+    H, W = img_bgr.shape[:2]
+    g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    m = cv2.blur(g, (7, 7))
+    busy = np.sqrt(np.maximum(cv2.blur(g * g, (7, 7)) - m * m, 0)) > 6
+    kept, gone = [], []
+    for ic in icons:
+        if id(ic) in keep_ids or ic.kind != "图标" or ic.why.startswith(("手动", "学习")):
+            kept.append(ic)
+            continue
+        x, y, w, h = [int(v) for v in ic.box]
+        if ic.why.startswith("图形箭头"):
+            # 地图上弯弯的虚线航线、船尾的浪花也会被当成箭头，连带抠走一大片插画。真箭头不会这么大还分数不高
+            if (w * h > 0.012 * W * H and ic.score < 90) or (min(w, h) < 0.012 * W and ic.score < 60):
+                ic.why = "留在底图：是插画里的航线 / 浪花 / 碎线，不是箭头"
+                ic.score = min(ic.score, 45)
+                gone.append(ic)
+            else:
+                kept.append(ic)
+            continue
+        ctx = _context_busy(busy, text_mask, (x, y, w, h))
+        why = None
+        if min(w, h) < 0.02 * W:
+            why = "太小，像是插画里的零件"
+        elif ctx >= 0.42 or (ctx >= 0.3 and ic.score < 95):
+            why = "在插画场景里，是插画的一部分"
+        elif max(w, h) > 3 * min(w, h) and ic.score < 90 and w * h > 0.004 * W * H:
+            why = "细长的一截，是插画被切下来的部分"
+        elif (w * h > 0.04 * W * H and ic.score < 70) or (w * h > 0.015 * W * H and ic.score < 60):
+            why = "大块、分数低，是背景插画的一部分"
+        if why:
+            ic.why = f"留在底图：{why}（周围繁杂度 {ctx:.2f}）"
+            ic.score = min(ic.score, 45)
+            gone.append(ic)
+        else:
+            kept.append(ic)
+    return kept, gone
+
+
 def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="auto", with_pictures=True, on_stage=None,
                   ocr=None, edits=None, text_edits=None):
     """on_stage(阶段名, 数据)：每完成一个阶段回调一次，网页界面用它显示真实进度。
@@ -4601,6 +4756,13 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     if img is None:
         raise RuntimeError(f"读不了图片: {path}")
     H, W = img.shape[:2]
+    process_image.last_notes = []
+    if edits is None and not text_edits:                       # 这张图以前改过：直接用上次的修改
+        rem = learning.remembered_page(img)
+        if rem:
+            edits = rem.get("elements")
+            text_edits = rem.get("texts") or None
+            process_image.last_notes.append("这张图以前改过，已按上次的修改生成")
     tell("ocr")
     if ocr is not None:
         lines, used = copy.deepcopy(ocr), "沿用上次的文字识别"
@@ -4614,6 +4776,10 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     n_conf = fix_confusables(lines)                            # 形近字纠错（"目我剖析"→"自我剖析"）
     if n_conf:
         used += f"（形近字纠正 {n_conf} 处）"
+    n_learn = learning.fix_text(lines)                         # 你以前改过的错字
+    if n_learn:
+        used += f"（按以前的改字纠正 {n_learn} 行）"
+        process_image.last_notes.append(f"按你以前改过的字，自动纠正了 {n_learn} 行")
     lines = _clean_lines(lines, W)
     strip_icon_glyph(img, lines)                               # 行首被认成"品""口"的小图标，留给图标那一步
     strip_side_bars(img, lines)
@@ -4758,6 +4924,20 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
                 a = cv2.dilate((ic.rgba[..., 3] > 8).astype(np.uint8) * 255, np.ones((7, 7), np.uint8))
                 icon_mask[ic.y:ic.y + hh, ic.x:ic.x + ww] = np.maximum(icon_mask[ic.y:ic.y + hh, ic.x:ic.x + ww], a)
         arrow_regions = [a for a in arrow_regions if not _on_pale_graphic(pale_graphic, a.box)]
+    icons, scene_bits = drop_scene_fragments(img, icons, mask)   # 插画里被切出来的碎块：留在底图里
+    rejected += scene_bits
+    icon_mask = icon_mask.copy()
+    for ic in scene_bits:                                      # 它们占的位置不再抹掉
+        hh, ww = ic.rgba.shape[:2]
+        a = ic.rgba[..., 3] > 8
+        sub = icon_mask[ic.y:ic.y + hh, ic.x:ic.x + ww]
+        sub[cv2.dilate(a.astype(np.uint8), np.ones((9, 9), np.uint8))[:sub.shape[0], :sub.shape[1]] > 0] = 0
+    if scene_bits:
+        for ic in icons:                                       # 和它挨着的、留下的图标：抹除范围补回来
+            hh, ww = ic.rgba.shape[:2]
+            a = cv2.dilate((ic.rgba[..., 3] > 8).astype(np.uint8) * 255, np.ones((7, 7), np.uint8))
+            sub = icon_mask[ic.y:ic.y + hh, ic.x:ic.x + ww]
+            sub[...] = np.maximum(sub, a[:sub.shape[0], :sub.shape[1]])
     icons = b_icons + icons
     icon_mask = np.maximum(icon_mask, b_erase)
     for arrow in arrow_regions:
@@ -4803,6 +4983,15 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
         full = np.zeros((H, W), np.uint8)
         full[ay:ay + ah, ax:ax + aw][arrow.mask] = 255
         icon_mask = np.maximum(icon_mask, cv2.dilate(full, np.ones((7, 7), np.uint8)))
+    learned = False
+    if edits is None and with_icons:                           # 用以前的修改训练出来的模型，再判断一遍每个候选框
+        try:
+            l_edits, l_notes = learning.decide_elements(img, icons, pics, rejected, mask)
+        except Exception:
+            l_edits, l_notes = None, []
+        if l_edits is not None:
+            edits, learned = l_edits, True
+            process_image.last_notes += l_notes
     if edits is not None:
         keep_src = {tuple(int(v) for v in e["src"]) for e in edits if e.get("src")}
         # 图片：清单里没有的不再抠
@@ -4828,6 +5017,8 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
             if e.get("src"):
                 continue
             el, sel, clean_edge = _manual_element(img, e["box"], e.get("kind", "图标"), mask)
+            if learned:
+                el.score, el.why = 60, "学习：按以前的修改补上 / 改了类别"
             if el.kind == "图片":
                 pics.append(el)
                 pic_sel.append(sel)
@@ -4837,7 +5028,7 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
             else:
                 icons.append(el)
                 icon_mask[cv2.dilate(sel.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0] = 255
-    if with_icons and edits is None:                           # 补抠：圆框图标、时间轴上的图标，前面的规则容易漏掉
+    if with_icons and (edits is None or learned):              # 补抠：圆框图标、时间轴上的图标，前面的规则容易漏掉
         taken = np.maximum(np.maximum(cv2.dilate(mask, np.ones((3, 3), np.uint8)), icon_mask), pic_mask) > 0
         for e in pics + icons:
             taken[e.y:e.y + e.rgba.shape[0], e.x:e.x + e.rgba.shape[1]] = True
@@ -4848,6 +5039,19 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
             el.score, el.why = 60, "补抠：没有被别的元素认领的图形"
             icons.append(el)
             icon_mask[cv2.dilate(sel.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0] = 255
+    if with_icons and edits is None:                           # 后面几步补进来的也再筛一遍（人工改过的不动）
+        icons, late_bits = drop_scene_fragments(img, icons, mask, {id(b) for b in b_icons})
+        if late_bits:
+            rejected += late_bits
+            for ic in late_bits:
+                hh, ww = ic.rgba.shape[:2]
+                sub = icon_mask[ic.y:ic.y + hh, ic.x:ic.x + ww]
+                sub[cv2.dilate((ic.rgba[..., 3] > 8).astype(np.uint8), np.ones((9, 9), np.uint8))[:sub.shape[0], :sub.shape[1]] > 0] = 0
+            for ic in icons:
+                hh, ww = ic.rgba.shape[:2]
+                a = cv2.dilate((ic.rgba[..., 3] > 8).astype(np.uint8) * 255, np.ones((7, 7), np.uint8))
+                sub = icon_mask[ic.y:ic.y + hh, ic.x:ic.x + ww]
+                sub[...] = np.maximum(sub, a[:sub.shape[0], :sub.shape[1]])
     tell("icon", [[int(v) for v in ic.box] + [ic.score, ic.why] for ic in icons])
     tell("rejected", [[int(v) for v in ic.box] + [ic.score, ic.why] for ic in rejected])
     pictures = find_picture_regions(img, mask)                 # 贴着画面边缘、没法整张抠出来的照片区域
@@ -5053,6 +5257,23 @@ def main():
     files = collect_inputs(args.inputs)
     if not files:
         sys.exit("没有找到图片")
+    # 一张图里拼着好几页的：先拆成单页（放到临时文件夹）
+    import tempfile
+    split_dir, expanded = None, []
+    for path in files:
+        im = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        parts = split_contact_sheet(im) if im is not None else []
+        if not parts:
+            expanded.append(path)
+            continue
+        split_dir = split_dir or tempfile.mkdtemp(prefix="img2pptx_split_")
+        stem = os.path.splitext(os.path.basename(path))[0]
+        print(f"  {os.path.basename(path)} 是 {len(parts)} 页拼在一起的缩略图，拆成单页分别转换")
+        for k, part in enumerate(parts):
+            q = os.path.join(split_dir, f"{stem}_第{k + 1:02d}页.png")
+            cv2.imencode(".png", part)[1].tofile(q)
+            expanded.append(q)
+    files = expanded
     prs = None
     for path in files:
         clean, blocks, icons, W, H = process_image(

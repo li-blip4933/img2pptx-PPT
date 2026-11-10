@@ -25,6 +25,7 @@ import cv2
 import numpy as np
 
 import img2pptx as core
+import learning
 import page_check
 
 # 公开模式（部署到服务器给别人用）：设环境变量 IMG2PPTX_PUBLIC=1。
@@ -32,10 +33,10 @@ import page_check
 PUBLIC = os.environ.get("IMG2PPTX_PUBLIC") == "1"
 HOST = "0.0.0.0" if PUBLIC else "127.0.0.1"
 PORT = int(os.environ.get("PORT", "7860" if PUBLIC else "8765"))
-MAX_PAGES = int(os.environ.get("IMG2PPTX_MAX_PAGES", "12")) if PUBLIC else 10 ** 6
+MAX_PAGES = int(os.environ.get("IMG2PPTX_MAX_PAGES", "16")) if PUBLIC else 10 ** 6
 KEEP_SECONDS = 3600                                               # 公开模式下任务保留多久
 HERE = os.path.dirname(os.path.abspath(__file__))
-WORK = os.path.join(tempfile.gettempdir(), "img2pptx_web")       # 上传的图和生成的文件放这里，重启时清空
+WORK = os.path.join(tempfile.gettempdir(), f"img2pptx_web_{PORT}")  # 上传的图和生成的文件放这里，重启时清空（按端口分开，本机版和在线版互不影响）
 MAX_UPLOAD = 40 * 1024 * 1024                                     # 单张图片上限 40 MB
 ALLOWED = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
 
@@ -117,6 +118,7 @@ def _run_job(job, only=None):
                     path, "auto", "chi_sim+eng", with_icons=False, with_pictures=False,
                     inpaint=job["opts"]["inpaint"], on_stage=on_stage, ocr=job["ocr"][i],
                     text_edits=job["textedits"][i])
+            job.setdefault("notes", [[] for _ in range(n)])[i] = list(getattr(core.process_image, "last_notes", []))
             job["ocr"][i] = core.process_image.last_ocr      # 文字识别最费时间，留着，人工调整后重新生成时不用再做
             job["rejected"][i] = list(getattr(core.process_image, "last_rejected", []))
             job["done"] = i + 1
@@ -150,6 +152,7 @@ def _run_job(job, only=None):
                 "picture": [row(ic) for ic in icons if ic.kind == "图片"],
                 "rejected": [row(ic) for ic in job["rejected"][i]],
                 "edited": job["edits"][i] is not None or bool(job["textedits"][i]),
+                "notes": job["notes"][i] if i < len(job.get("notes", [])) else [],
                 "issues": [],
             })
             try:                                            # 自检只负责报告：出错也不影响转换结果
@@ -235,7 +238,8 @@ class Handler(BaseHTTPRequestHandler):
                 ocr = "rapidocr"
             except ImportError:
                 ocr = "tesseract"
-            return self.send_json({"lama": lama, "ocr": ocr, "public": PUBLIC, "max_pages": MAX_PAGES if PUBLIC else None})
+            return self.send_json({"lama": lama, "ocr": ocr, "public": PUBLIC, "max_pages": MAX_PAGES if PUBLIC else None,
+                                   "learning": learning.stats()})
         m = re.fullmatch(r"/api/jobs/(\w+)", path)
         if m:
             job = self.job_or_404(m.group(1))
@@ -289,17 +293,21 @@ class Handler(BaseHTTPRequestHandler):
             img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
             if img is None:
                 return self.send_json({"error": f"{name} 打不开，文件可能损坏"}, 400)
-            if len(job["files"]) >= MAX_PAGES:
-                return self.send_json({"error": f"在线版每次最多转换 {MAX_PAGES} 张，{name} 没有加入"}, 413)
-            i = len(job["files"])
-            # 统一存成 PNG：既给转换用，也给页面预览用（浏览器不一定能直接显示所有格式）
             stem = os.path.splitext(name)[0]
-            src = os.path.join(job["dir"], f"{i:03d}_{stem}.png")
-            cv2.imencode(".png", img)[1].tofile(src)
-            shutil.copyfile(src, os.path.join(job["dir"], f"orig_{i}.png"))
-            job["files"].append(src)
-            job["names"].append(name)
-            return self.send_json({"index": i, "w": int(img.shape[1]), "h": int(img.shape[0])})
+            parts = core.split_contact_sheet(img)              # 一张图里拼着好几页：拆成单页
+            items = [(img, name)] if not parts else [(pp, f"{stem}_第{k + 1}页.png") for k, pp in enumerate(parts)]
+            if len(job["files"]) + len(items) > MAX_PAGES:
+                return self.send_json({"error": f"在线版每次最多转换 {MAX_PAGES} 张，{name} 没有加入"}, 413)
+            first = len(job["files"])
+            for pic, nm in items:
+                i = len(job["files"])
+                # 统一存成 PNG：既给转换用，也给页面预览用（浏览器不一定能直接显示所有格式）
+                src = os.path.join(job["dir"], f"{i:03d}_{os.path.splitext(nm)[0]}.png")
+                cv2.imencode(".png", pic)[1].tofile(src)
+                shutil.copyfile(src, os.path.join(job["dir"], f"orig_{i}.png"))
+                job["files"].append(src)
+                job["names"].append(nm)
+            return self.send_json({"index": first, "pages": len(items), "w": int(img.shape[1]), "h": int(img.shape[0])})
         m = re.fullmatch(r"/api/jobs/(\w+)/start", u.path)
         if m:
             self.rfile.read(length)
@@ -322,13 +330,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"error": "上一次转换还没结束"}, 409)
             try:
                 req = json.loads(body.decode("utf-8"))["pages"]
-                only = []
+                only, lessons = [], []
                 for k, v in req.items():
                     i = int(k)
                     if not 0 <= i < len(job["files"]):
                         raise ValueError("页码不对")
                     if v is None:                               # 恢复自动识别：图形和文字的修改都清掉
                         job["edits"][i], job["textedits"][i] = None, []
+                        job.setdefault("forget", []).append(i)
                         only.append(i)
                         continue
                     if isinstance(v, list):                     # 旧格式：只有图形清单
@@ -345,8 +354,31 @@ class Handler(BaseHTTPRequestHandler):
                             "src": [float(x) for x in e["src"]][:4] if e.get("src") else None,
                             "text": None if t is None else str(t)[:500]})
                     only.append(i)
+                    lessons.append((i, job["edits"][i] if lst is not None else None,
+                                    job["textedits"][i][len(job["textedits"][i]) - len(v.get("texts") or []):]))
             except Exception as e:
                 return self.send_json({"error": f"调整内容格式不对：{e}"}, 400)
+            pages_before = list(job.get("pages") or [])
+            def learn(lessons=lessons, pages_before=pages_before, forget=job.pop("forget", [])):
+                """把这次的修改记成教训（在后台做，不耽误重新生成）"""
+                for i, elements, texts in lessons:
+                    try:
+                        if i >= len(pages_before):
+                            continue
+                        src = cv2.imdecode(np.fromfile(job["files"][i], dtype=np.uint8), cv2.IMREAD_COLOR)
+                        tmask = np.zeros(src.shape[:2], np.uint8)
+                        for r in pages_before[i].get("lines", []):
+                            x, y, w, h = [int(v) for v in r[:4]]
+                            tmask[max(0, y):y + h, max(0, x):x + w] = 255
+                        learning.record_page(src, pages_before[i], elements, texts, tmask)
+                    except Exception:
+                        traceback.print_exc()
+                for i in forget:
+                    try:
+                        learning.forget_page(cv2.imdecode(np.fromfile(job["files"][i], dtype=np.uint8), cv2.IMREAD_COLOR))
+                    except Exception:
+                        traceback.print_exc()
+            threading.Thread(target=learn, daemon=True).start()
             job["state"], job["error"] = "queued", None
             threading.Thread(target=run_job, args=(job, only), daemon=True).start()
             return self.send_json(public(job))

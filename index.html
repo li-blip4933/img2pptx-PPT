@@ -113,6 +113,7 @@
   .page-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;
                padding: 12px 16px; border-bottom: 1px solid var(--line); }
   .page-head .title { font-weight: 600; font-size: 14px; }
+  .page-head .title .learn-note { font-weight: 400; font-size: 12px; color: var(--icon-layer); margin-top: 3px; }
   .page-head .title small { font-family: var(--mono); font-weight: 400; color: var(--soft); margin-left: 8px; }
   .chips { display: flex; gap: 8px; flex-wrap: wrap; }
   .chip { font: inherit; font-size: 13px; border: 1.5px solid var(--c); color: var(--c); background: transparent;
@@ -315,6 +316,13 @@ fetch('/api/info').then(r => r.json()).then(info => {
   const ocr = info.ocr === 'rapidocr' ? '<b>RapidOCR</b>（中英文）' : '<b class="warn">Tesseract</b>（未装 RapidOCR，中文可能识别不了）';
   const fill = info.lama ? '<b>LaMa 模型</b>' : '<b class="warn">快速算法</b>（未找到 LaMa 模型）';
   $('env').innerHTML = `${info.public ? '在线版 · 开源免费' : '在本机运行 · 不联网'}<br>文字识别 ${ocr}<br>背景补全 ${fill}`;
+  const L = info.learning || {};
+  if (L.enabled) {
+    let t = L.corrections ? `从你的 ${L.corrections} 次修改里学习中` : '会从你的修改里学习';
+    if (L.active && L.recent_rate != null) t += ` · 最近自动结果 ${Math.round(L.recent_rate * 100)}% 不用改`;
+    else if (L.corrections) t += '（再改几页就开始生效）';
+    $('env').innerHTML += `<br>${t}`;
+  }
   if (info.public) {
     MAX_PAGES = info.max_pages;
     $('localOnly').hidden = true; $('publicOnly').hidden = false;
@@ -394,9 +402,11 @@ function addBoxes(stage, kind, list, W, H, imgUrl, pop) {
 const live = { page: -1, drawn: {}, url: null, w: 0, h: 0 };
 function setLiveImage(i) {
   if (live.url) URL.revokeObjectURL(live.url);
-  live.page = i; live.drawn = {}; live.url = URL.createObjectURL(files[i]);
+  live.page = i; live.drawn = {};
+  // 拼图拆开后，服务器上的页数比选的图片多：用服务器上的那一页
+  live.url = live.serverJob ? null : URL.createObjectURL(files[i]);
   const st = $('liveStage'); st.querySelectorAll('.box').forEach(b => b.remove());
-  $('liveImg').src = live.url;
+  $('liveImg').src = live.serverJob ? `/api/jobs/${live.serverJob}/image/${i}/orig` : live.url;
   document.querySelectorAll('#steps li').forEach(li => { li.className = li.className.replace(/ (on|ok)/g, ''); li.querySelector('b').textContent = ''; });
 }
 const ORDER = ['ocr', 'text', 'picture', 'icon', 'erase'];
@@ -442,16 +452,22 @@ $('start').addEventListener('click', async () => {
                                     inpaint: $('optFast').checked ? 'telea' : 'auto' });
     const { id } = await api('/api/jobs?' + q, { method: 'POST' });
     setLiveImage(0); $('liveStage').dataset.stage = 'upload';
+    let pagesTotal = 0, splitMsg = [];
+    live.serverJob = null;
     for (let i = 0; i < total; i++) {
       $('what').textContent = `正在上传第 ${i + 1} / ${total} 张`;
       $('fill').style.width = `${(i / total) * 8}%`;
-      await api(`/api/jobs/${id}/files?name=${encodeURIComponent(files[i].name)}`, { method: 'POST', body: files[i] });
+      const r = await api(`/api/jobs/${id}/files?name=${encodeURIComponent(files[i].name)}`, { method: 'POST', body: files[i] });
+      pagesTotal += r.pages || 1;
+      if ((r.pages || 1) > 1) splitMsg.push(`${files[i].name} 里拼着 ${r.pages} 页，已自动拆成单页`);
     }
+    if (pagesTotal !== total) { live.serverJob = id; setLiveImage(0); }
     await api(`/api/jobs/${id}/start`, { method: 'POST' });
     $('runHint').textContent = $('optFast').checked
       ? '快速模式下每张图几秒钟。'
       : '每张图大约 15 到 30 秒，第一张要多等几秒加载模型。';
-    await waitJob(id, total);
+    if (splitMsg.length) $('runHint').textContent = splitMsg.join('；') + '。' + $('runHint').textContent;
+    await waitJob(id, pagesTotal);
   } catch (err) {
     $('run').hidden = true; $('pick').hidden = false;
     showErr(`转换没有完成：${err.message}`);
@@ -493,7 +509,7 @@ function makeEditor(p, i, sec, stage) {
   editors[i] = ed;
   const layer = document.createElement('div'); layer.className = 'edit-layer'; stage.append(layer);
   const bar = document.createElement('div'); bar.className = 'edit-bar';
-  bar.innerHTML = '<span>点一下框就能改：文字框改字或删掉，图标 / 图片框拖动、拉角改大小。漏掉的字或图，在空白处拖一个框补上。</span>';
+  bar.innerHTML = '<span>你的每次修改都会被记住，下次识别会更准。点一下框就能改：文字框改字或删掉，图标 / 图片框拖动、拉角改大小。漏掉的字或图，在空白处拖一个框补上。</span>';
   const resetA = document.createElement('a'); resetA.href = '#'; resetA.textContent = '撤销这一页的全部修改';
   resetA.onclick = ev => { ev.preventDefault(); ed.reset = true; ed.dirty = false; ed.sel = null; refreshRedo(); bar.querySelector('span').textContent = '这一页会恢复成自动识别的结果。'; draw(); };
   const apply = document.createElement('button'); apply.className = 'apply'; apply.type = 'button'; apply.textContent = '应用修改'; apply.disabled = true;
@@ -695,6 +711,10 @@ function showResult(job) {
     const head = document.createElement('div'); head.className = 'page-head';
     const title = document.createElement('div'); title.className = 'title';
     title.innerHTML = `第 ${i + 1} 页<small></small>`; title.querySelector('small').textContent = `${p.name} · ${p.w}×${p.h}`;
+    if (p.notes && p.notes.length) {
+      const nt = document.createElement('div'); nt.className = 'learn-note'; nt.textContent = '学习：' + p.notes.join('；');
+      title.append(nt);
+    }
     const chips = document.createElement('div'); chips.className = 'chips';
     for (const [k, cls, label] of [['text', 't', '文字'], ['icon', 'i', '图标'], ['picture', 'p', '图片'], ['rejected', 'r', '未抠出'], ['issue', 'c', '自检']]) {
       if (!p[k]) p[k] = [];
