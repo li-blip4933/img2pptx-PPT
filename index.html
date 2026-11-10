@@ -319,7 +319,8 @@ fetch('/api/info').then(r => r.json()).then(info => {
   const L = info.learning || {};
   if (L.enabled) {
     let t = L.corrections ? `从你的 ${L.corrections} 次修改里学习中` : '会从你的修改里学习';
-    if (L.active && L.recent_rate != null) t += ` · 最近自动结果 ${Math.round(L.recent_rate * 100)}% 不用改`;
+    if (L.exam && L.exam.new != null) t += ` · 自测：规则 ${Math.round(L.exam.rules_only * 100)}% → 学习后 ${Math.round(((L.adopted || L.exam.current == null) ? L.exam.new : L.exam.current) * 100)}%（第 ${L.version || 0} 版）`;
+    else if (L.active && L.recent_rate != null) t += ` · 最近自动结果 ${Math.round(L.recent_rate * 100)}% 不用改`;
     else if (L.corrections) t += '（再改几页就开始生效）';
     $('env').innerHTML += `<br>${t}`;
   }

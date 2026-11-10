@@ -196,6 +196,7 @@ def record_page(img_bgr, page, elements=None, text_edits=None, text_mask=None):
             with open(_path("samples.jsonl"), "a", encoding="utf-8") as f:
                 for r in rows:
                     r["t"], r["key"] = now, key
+                    r.setdefault("src", "edit")
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
         # 同一张图：记住最终想要的样子，下次直接用
         pages = _load_json("pages.json", {})
@@ -286,29 +287,63 @@ def _predict(m, X):
     return 1 / (1 + np.exp(-Z @ np.asarray(m["beta"])))
 
 
+def _decide_acc(model_keep, X, y, w):
+    """在一批有答案的样本上，算"规则分 + 模型"的综合判断有多准（和 decide_elements 用的是同一个算法）。"""
+    rule = X[:, FEATURE_NAMES.index("自动分")]
+    if model_keep is None:
+        pred = rule >= 0.5
+    else:
+        pred = _predict(model_keep, X) >= 0.5                 # 规则分本身就是模型的一个输入，由模型直接拍板
+    return float((w * (pred == (y > 0.5))).sum() / max(w.sum(), 1e-6))
+
+
 def train():
-    """用全部教训重新训练，存成 learning/model.json。几百条数据只要几十毫秒。"""
+    """用全部教训训练一个新版本，但先"考试"再上岗（自我进化，但不会越学越差）：
+      · 考卷 = 你最近亲手改过的那部分样本（按时间留出最近的 30%，最多 200 条）
+      · 新版本只用考卷以外的数据训练，在考卷上的成绩不低于现在这一版，才替换；否则继续用旧版
+      · 同时记下"只用规则"的成绩，网页上能看到学习到底有没有帮上忙
+    "下载时没改"带来的隐式样本只参与训练、不进考卷（它们只是"你没反对"，不如亲手改的可靠）。"""
     S = _samples()
     if not S:
         return None
     X = np.array([s["f"] for s in S], float)
     y = np.array([s["keep"] for s in S], float)
     w = np.array([s.get("w", 1.0) for s in S], float)
-    model = {"n": len(S), "n_keep": int(y.sum()), "n_drop": int((1 - y).sum()), "t": time.time()}
-    if y.sum() >= 3 and (1 - y).sum() >= 3:
-        model["keep"] = _fit_logreg(X, y, w)
-        # 自测：留一法的准确率（数据少时偏乐观，仅供参考）
-        if len(S) <= 400:
-            hits = 0
-            for i in range(len(S)):
-                msk = np.ones(len(S), bool)
-                msk[i] = False
-                if y[msk].sum() < 2 or (1 - y[msk]).sum() < 2:
-                    hits += 1
-                    continue
-                m = _fit_logreg(X[msk], y[msk], w[msk], iters=200)
-                hits += int((_predict(m, X[i:i + 1])[0] > 0.5) == (y[i] > 0.5))
-            model["self_test"] = round(hits / len(S), 3)
+    t = np.array([s.get("t", 0) for s in S], float)
+    explicit = np.array([s.get("src", "edit") == "edit" for s in S])
+    old = _load_json("model.json", {})
+    model = {"n": len(S), "n_explicit": int(explicit.sum()), "n_keep": int(y.sum()), "n_drop": int((1 - y).sum()),
+             "t": time.time(), "version": old.get("version", 0)}
+    ok_data = y.sum() >= 3 and (1 - y).sum() >= 3
+    cand = _fit_logreg(X, y, w) if ok_data else None
+    # 考试
+    ex_idx = np.where(explicit)[0]
+    exam = ex_idx[np.argsort(-t[ex_idx])][:min(200, max(6, int(0.3 * len(ex_idx))))] if len(ex_idx) >= 10 else np.array([], int)
+    adopt, report = cand is not None, {}
+    if cand is not None and len(exam):
+        train_mask = np.ones(len(S), bool)
+        train_mask[exam] = False
+        yt = y[train_mask]
+        if yt.sum() >= 2 and (1 - yt).sum() >= 2:
+            challenger = _fit_logreg(X[train_mask], yt, w[train_mask])
+            Xe, ye, we = X[exam], y[exam], np.ones(len(exam))
+            report = {"exam_size": int(len(exam)),
+                      "rules_only": round(_decide_acc(None, Xe, ye, we), 3),
+                      "new": round(_decide_acc(challenger, Xe, ye, we), 3)}
+            bar = report["rules_only"] + 0.01                  # 必须比"只用规则"好，学习才有意义
+            if old.get("keep"):
+                report["current"] = round(_decide_acc(old["keep"], Xe, ye, we), 3)
+                bar = max(bar, report["current"] - 0.005)
+            adopt = report["new"] >= bar
+    if adopt and cand is not None:
+        model["keep"] = cand
+        model["version"] = old.get("version", 0) + 1
+    elif old.get("keep") and report.get("current", 1) > report.get("rules_only", 0):
+        model["keep"] = old["keep"]                           # 新版本没考过：继续用旧版
+    elif old.get("keep"):
+        model["paused"] = True                                # 旧版也不如规则了：暂停学习，只用规则
+    model["exam"] = report
+    model["adopted"] = bool(adopt and cand is not None)
     # 图标 / 图片的类别：只有你真的改过类别（至少 3 次）才学，否则全是程序自己的判断，学了也没用
     kept = [s for s in S if s["keep"]]
     yk = np.array([1.0 if s["kind"] == "图片" else 0.0 for s in kept])
@@ -318,8 +353,42 @@ def train():
         model["kind"] = _fit_logreg(np.array([s["f"] for s in kept], float), yk, np.ones(len(kept)))
     with _LOCK:
         _save_json("model.json", model)
+        os.makedirs(LEARN_DIR, exist_ok=True)
+        with open(_path("evolution.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"t": model["t"], "version": model["version"], "adopted": model["adopted"],
+                                "n": len(S), **report}, ensure_ascii=False) + "\n")
         _CACHE.clear()
     return model
+
+
+def record_implicit(img_bgr, page, text_mask=None):
+    """下载时这一页没改：当作"自动结果你认可了"，记成弱一点的教训（权重 0.3，不进考卷）。
+    同一张图只记一次，免得反复下载把它的分量堆高。"""
+    if not enabled():
+        return 0
+    key = image_key(img_bgr)
+    seen = _load_json("implicit_seen.json", {})
+    if key in seen or key in _load_json("pages.json", {}):
+        return 0
+    rows = []
+    for r in page.get("icon", []) + page.get("picture", []):
+        rows.append({"f": box_features(img_bgr, r[:4], text_mask, r[4] if len(r) > 4 else 60), "keep": 1,
+                     "kind": "图片" if r in page.get("picture", []) else "图标", "w": 0.3, "src": "implicit"})
+    for r in page.get("rejected", []):
+        rows.append({"f": box_features(img_bgr, r[:4], text_mask, r[4] if len(r) > 4 else 40), "keep": 0,
+                     "kind": "图标", "w": 0.2, "src": "implicit"})
+    if not rows:
+        return 0
+    now = time.time()
+    with _LOCK:
+        os.makedirs(LEARN_DIR, exist_ok=True)
+        with open(_path("samples.jsonl"), "a", encoding="utf-8") as f:
+            for r in rows:
+                r["t"], r["key"] = now, key
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        seen[key] = now
+        _save_json("implicit_seen.json", seen)
+    return len(rows)
 
 
 def _model():
@@ -360,16 +429,17 @@ def decide_elements(img_bgr, icons, pics, rejected, text_mask=None):
     if not enabled():
         return None, []
     m = _model()
-    if "keep" not in m or m.get("n_keep", 0) < 4 or m.get("n_drop", 0) < 4 or m.get("n", 0) < MIN_SAMPLES:
+    if "keep" not in m or m.get("n_keep", 0) < 4 or m.get("n_drop", 0) < 4 \
+            or m.get("n_explicit", m.get("n", 0)) < MIN_SAMPLES or m.get("version", 1) < 1:
         return None, []
     def judge(el, score):
         f = box_features(img_bgr, el.box, text_mask, score)
-        p_lr = float(_predict(m["keep"], [f])[0])
+        p = float(_predict(m["keep"], [f])[0])
         kn = _knn(f)
-        p = p_lr if kn is None else 0.5 * p_lr + 0.5 * kn[0]
-        # 离以前见过的样子很远时，少听模型的
-        wgt = MODEL_WEIGHT if kn is None or kn[1] < 3.0 else MODEL_WEIGHT * 0.4
-        combined = (1 - wgt) * (score / 100.0) + wgt * p
+        if kn is not None and kn[1] < 3.0:                     # 以前见过很像的：近邻投票也算一半
+            p = 0.5 * p + 0.5 * kn[0]
+        elif kn is not None:                                   # 离见过的样子很远：往规则分靠
+            p = 0.5 * p + 0.5 * (score / 100.0)
         kind = el.kind
         if "kind" in m:
             pk = float(_predict(m["kind"], [f])[0])
@@ -377,11 +447,11 @@ def decide_elements(img_bgr, icons, pics, rejected, text_mask=None):
                 kind = "图片"
             elif el.kind == "图片" and pk < 0.2:
                 kind = "图标"
-        return combined, kind
+        return p, kind
     edits, dropped, added, swapped = [], 0, 0, 0
     for el in list(pics) + list(icons):
         combined, kind = judge(el, el.score)
-        if combined < 0.42:
+        if combined < 0.4:
             dropped += 1
             continue
         if kind != el.kind:
@@ -391,7 +461,7 @@ def decide_elements(img_bgr, icons, pics, rejected, text_mask=None):
             edits.append({"box": list(el.box), "kind": el.kind, "src": list(el.box)})
     for el in rejected:
         combined, kind = judge(el, el.score)
-        if combined >= 0.6:
+        if combined >= 0.65:
             added += 1
             edits.append({"box": list(el.box), "kind": kind, "src": None})
     if not (dropped or added or swapped):
@@ -452,8 +522,10 @@ def stats():
     g = [h for h in hist if h["kind"] == "图形"]
     fixes = _load_json("text_fixes.json", {})
     return {"enabled": True, "samples": m.get("n", 0), "corrections": len(hist), "text_fixes": len(fixes),
-            "active": "keep" in m and m.get("n", 0) >= MIN_SAMPLES and m.get("n_keep", 0) >= 4 and m.get("n_drop", 0) >= 4,
+            "active": "keep" in m and m.get("n_explicit", m.get("n", 0)) >= MIN_SAMPLES and m.get("n_keep", 0) >= 4
+                      and m.get("n_drop", 0) >= 4 and m.get("version", 1) >= 1,
             "self_test": m.get("self_test"), "first_rate": rate(g[:10]), "recent_rate": rate(g[-10:]),
+            "version": m.get("version", 0), "exam": m.get("exam", {}), "adopted": m.get("adopted", False), "implicit_pages": len(_load_json("implicit_seen.json", {})),
             "pages": len(_load_json("pages.json", {}))}
 
 

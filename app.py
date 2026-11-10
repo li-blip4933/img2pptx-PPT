@@ -176,6 +176,28 @@ def _run_job(job, only=None):
         job["state"] = "error"
 
 
+def learn_from_download(job):
+    """下载了、但这一页没改：当作"自动结果你认可了"，记成弱一点的教训；攒够了再训练（训练会先考试再上岗）。"""
+    n = 0
+    for i, page in enumerate(job.get("pages") or []):
+        if job["edits"][i] is not None or job["textedits"][i] or page.get("notes"):
+            continue                                            # 改过的、按以前修改生成的：不算"认可自动结果"
+        try:
+            src = cv2.imdecode(np.fromfile(job["files"][i], dtype=np.uint8), cv2.IMREAD_COLOR)
+            tmask = np.zeros(src.shape[:2], np.uint8)
+            for r in page.get("lines", []):
+                x, y, w, h = [int(v) for v in r[:4]]
+                tmask[max(0, y):y + h, max(0, x):x + w] = 255
+            n += learning.record_implicit(src, page, tmask)
+        except Exception:
+            traceback.print_exc()
+    if n:
+        try:
+            learning.train()
+        except Exception:
+            traceback.print_exc()
+
+
 def public(job):
     keys = ("id", "state", "done", "pages", "error", "seconds", "live")
     out = {k: job[k] for k in keys}
@@ -264,6 +286,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if job["state"] != "done":
                 return self.send_json({"error": "还没转换完"}, 409)
+            threading.Thread(target=learn_from_download, args=(job,), daemon=True).start()
             return self.send_file(job["output"], "application/vnd.openxmlformats-officedocument.presentationml.presentation",
                                   job["output_name"])
         self.send_json({"error": "没有这个地址"}, 404)
