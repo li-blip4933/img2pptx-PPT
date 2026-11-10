@@ -537,3 +537,37 @@ def forget_page(img_bgr):
         pages = _load_json("pages.json", {})
         if pages.pop(image_key(img_bgr), None) is not None:
             _save_json("pages.json", pages)
+
+
+def record_self(img_bgr, log, text_mask=None):
+    """自检自修发现并验证过的问题，也记成教训（不需要人）：
+      · 回渲染比对改正的错字 → 进错字对照表
+      · 补抠的漏掉图标 → 记成"这类东西该抠"（权重 0.5，不进考卷：考卷只用你亲手改的）"""
+    if not enabled() or not log:
+        return 0
+    n = 0
+    pairs = log.get("text") or []
+    if pairs:
+        table = _load_json("text_fixes.json", {})
+        for old, new in pairs:
+            for i, (a, b) in enumerate(zip(old, new)):
+                if a != b:
+                    lo, hi = max(0, i - 1), min(len(old), i + 2)
+                    k = old[lo:hi] + "\t" + new[lo:hi]
+                    table[k] = table.get(k, 0) + 1
+                    n += 1
+        with _LOCK:
+            _save_json("text_fixes.json", table)
+            _CACHE.clear()
+    boxes = log.get("added") or []
+    if boxes:
+        now, key = time.time(), image_key(img_bgr)
+        with _LOCK:
+            os.makedirs(LEARN_DIR, exist_ok=True)
+            with open(_path("samples.jsonl"), "a", encoding="utf-8") as f:
+                for b in boxes:
+                    f.write(json.dumps({"f": box_features(img_bgr, b, text_mask, 40), "keep": 1, "kind": "图标",
+                                        "w": 0.5, "src": "self", "t": now, "key": key}, ensure_ascii=False) + "\n")
+                    n += 1
+            _CACHE.clear()
+    return n

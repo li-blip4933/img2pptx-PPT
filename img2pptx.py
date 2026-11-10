@@ -5211,6 +5211,17 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
         clean[ly:ly + lh, lx:lx + lw][h_in] = fixed[h_in]
     refit_widths(kept)
     detect_italic(kept)
+    process_image.last_self_log = {}
+    if os.environ.get("IMG2PPTX_SELF_REPAIR") != "0":         # 自检自修：自己找问题、修完验证，变好才保留
+        import self_repair
+        clean, icons, sr_notes, sr_log = self_repair.run(img, clean, kept, icons, mask,
+                                                         allow_add=edits is None or learned)
+        process_image.last_notes += sr_notes
+        process_image.last_self_log = sr_log
+        try:
+            learning.record_self(img, sr_log, mask)            # 自己发现、验证过的问题也记下来，下次一开始就做对
+        except Exception:
+            pass
     blocks = group_lines(kept, img)
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
