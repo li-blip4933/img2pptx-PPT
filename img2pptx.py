@@ -26,6 +26,7 @@ import copy
 import csv
 import io
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -38,6 +39,8 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
 from pptx.oxml.ns import qn
 from pptx.util import Emu, Pt
+
+from arrow_graphics import detect_graphic_arrows
 
 SLIDE_W_EMU = 12192000          # 13.333 英寸，标准 16:9 宽度
 EMU_PER_PT = 12700
@@ -159,27 +162,253 @@ def default_ppt_font():
 # ----------------------------------------------------------------------------
 # 第 1 步：OCR
 # ----------------------------------------------------------------------------
-def ocr_rapid(img_bgr):
-    from rapidocr_onnxruntime import RapidOCR
-    if not hasattr(ocr_rapid, "engine"):
-        ocr_rapid.engine = RapidOCR()
-    try:                                                       # 新版本能给出每个字的位置，拆分多色文字时更准
-        result, _ = ocr_rapid.engine(img_bgr, return_word_box=True)
+_OCR_TILE_TRIGGER_SIDE = 1500
+_OCR_TILE_SIZE = (1000, 700)       # (宽, 高)：小于整页，且避免过大的 OCR 输入
+_OCR_TILE_OVERLAP = 0.22
+_OCR_TILE_EDGE_MARGIN = 12
+_OCR_TILE_MIN_SCORE = 0.85
+_OCR_STRIP_MIN_SCORE = 0.85
+_OCR_STRIP_HEIGHT = 52
+_OCR_STRIP_OVERLAP = 26
+
+
+def _ocr_tiles(width, height):
+    """Yield bounded overlapping crops as (x, y, width, height)."""
+    tile_w = min(width, _OCR_TILE_SIZE[0])
+    tile_h = min(height, _OCR_TILE_SIZE[1])
+    step_x = max(1, int(tile_w * (1 - _OCR_TILE_OVERLAP)))
+    step_y = max(1, int(tile_h * (1 - _OCR_TILE_OVERLAP)))
+
+    def starts(length, tile, step):
+        if length <= tile:
+            return [0]
+        values = list(range(0, length - tile + 1, step))
+        if values[-1] != length - tile:
+            values.append(length - tile)
+        return values
+
+    for y in starts(height, tile_h, step_y):
+        for x in starts(width, tile_w, step_x):
+            yield x, y, tile_w, tile_h
+
+
+def _rapidocr_call(engine, image):
+    try:
+        return engine(image, return_word_box=True)[0]
     except TypeError:
-        result, _ = ocr_rapid.engine(img_bgr)
+        return engine(image)[0]
+
+
+def _ocr_items_to_lines(result, offset_x=0, offset_y=0):
     lines = []
     for item in result or []:
         quad, text, score = item[0], item[1], item[2]
-        if float(score) < MIN_OCR_SCORE or not text.strip():
+        text = str(text).strip()
+        score = float(score)
+        if score < MIN_OCR_SCORE or not text:
             continue
-        q = np.array(quad)
+        q = np.asarray(quad, dtype=float)
         x0, y0 = q.min(axis=0)
         x1, y1 = q.max(axis=0)
-        ln = Line(text.strip(), int(x0), int(y0), int(x1 - x0), int(y1 - y0))
-        ln.score = float(score)
-        if len(item) >= 5 and "".join(item[4]) == ln.text and all(len(c) == 1 for c in item[4]):
-            ln.chars = [(int(np.array(bx)[:, 0].min()), int(np.array(bx)[:, 0].max())) for bx in item[3]]
+        ln = Line(text, int(round(x0 + offset_x)), int(round(y0 + offset_y)),
+                  int(round(x1 - x0)), int(round(y1 - y0)))
+        ln.score = score
+        if (len(item) >= 5 and item[3] and item[4]
+                and "".join(item[4]) == ln.text
+                and all(len(str(c)) == 1 for c in item[4])):
+            ln.chars = []
+            for box in item[3]:
+                bx = np.asarray(box, dtype=float)
+                ln.chars.append((int(round(bx[:, 0].min() + offset_x)),
+                                 int(round(bx[:, 0].max() + offset_x))))
         lines.append(ln)
+    return lines
+
+
+def _box_overlap_ratio(a, b):
+    """Intersection over the smaller box, useful for partial duplicate detections."""
+    x0, y0 = max(a.x, b.x), max(a.y, b.y)
+    x1, y1 = min(a.x + a.w, b.x + b.w), min(a.y + a.h, b.y + b.h)
+    intersection = max(0, x1 - x0) * max(0, y1 - y0)
+    smaller = min(max(1, a.w * a.h), max(1, b.w * b.h))
+    return intersection / smaller
+
+
+def _tile_candidate_is_complete(line, crop, image_shape):
+    x, y, width, height = crop
+    margin = _OCR_TILE_EDGE_MARGIN
+    # 候选字框接触裁切边缘时很可能是截断行；整页识别负责保留这类边缘内容。
+    image_h, image_w = image_shape[:2]
+    return ((x == 0 or line.x >= x + margin)
+            and (y == 0 or line.y >= y + margin)
+            and (x + width == image_w or line.x + line.w <= x + width - margin)
+            and (y + height == image_h or line.y + line.h <= y + height - margin)
+            and line.x >= 0 and line.y >= 0
+            and line.x + line.w <= image_w
+            and line.y + line.h <= image_h)
+
+
+def _is_cjk_char(ch):
+    return "\u3400" <= ch <= "\u9fff"
+
+
+def _is_short_tall_mixed_line(line):
+    text = line.text.strip()
+    return (0 < len(text) <= 3 and line.h > line.w * 1.2 and line.h > 60
+            and any(ch.isascii() and ch.isalpha() for ch in text))
+
+
+def _horizontal_bands(length, band_height=_OCR_STRIP_HEIGHT,
+                      overlap=_OCR_STRIP_OVERLAP, limit=10):
+    if length <= band_height:
+        return [0]
+    step = max(1, band_height - overlap)
+    starts = list(range(0, length - band_height + 1, step))
+    last = length - band_height
+    if starts[-1] != last:
+        starts.append(last)
+    return starts[:limit]
+
+
+def _recover_tall_line(engine, img_bgr, line):
+    """Read a narrow vertical OCR box as overlapping horizontal text rows."""
+    pad_x = max(22, int(round(line.w * 0.22)))
+    pad_y = max(24, int(round(line.h * 0.30)))
+    image_h, image_w = img_bgr.shape[:2]
+    x0, y0 = max(0, line.x - pad_x), max(0, line.y - pad_y)
+    x1 = min(image_w, line.x + line.w + pad_x)
+    y1 = min(image_h, line.y + line.h + pad_y)
+    region = img_bgr[y0:y1, x0:x1]
+    recovered = []
+    for band_index, top in enumerate(_horizontal_bands(region.shape[0])):
+        band = region[top:min(region.shape[0], top + _OCR_STRIP_HEIGHT), :]
+        try:
+            result = _rapidocr_call(engine, band)
+            candidates = _ocr_items_to_lines(result, x0, y0 + top)
+        except Exception:
+            continue
+        for candidate in candidates:
+            if candidate.score >= _OCR_STRIP_MIN_SCORE:
+                recovered.append((band_index, candidate))
+
+    # Collapse the same text found by overlapping strips, retaining its best box.
+    groups = {}
+    for band_index, candidate in recovered:
+        entry = groups.setdefault(candidate.text, {"bands": set(), "best": candidate})
+        entry["bands"].add(band_index)
+        if candidate.score > entry["best"].score:
+            entry["best"] = candidate
+    return groups
+
+
+def _same_spatial_text(line, candidates):
+    return any(_box_overlap_ratio(line, old) >= 0.65 for old in candidates)
+
+
+def _recoveries_for_mixed_line(groups, line):
+    # A one-letter main result (for example the PDCA “A”) is retained for glyph
+    # refinement; only repeated Chinese text below it is supplemented.
+    if len(line.text.strip()) == 1 and line.text.strip().isascii() and line.text.strip().isalpha():
+        return [entry["best"] for text, entry in groups.items()
+                if any(_is_cjk_char(ch) for ch in text)
+                and len(entry["bands"]) >= 2]
+    values = [entry["best"] for entry in groups.values()]
+    supported_bands = set().union(*(entry["bands"] for entry in groups.values())) if groups else set()
+    if len(values) >= 2 and len(supported_bands) >= 2:
+        return values
+    if len(values) == 1:
+        text = values[0].text
+        entry = groups[text]
+        if text in line.text and len(entry["bands"]) >= 2:
+            return values
+    return []
+
+
+def _supplement_or_replace_mixed(engine, img_bgr, line, existing):
+    groups = _recover_tall_line(engine, img_bgr, line)
+    recovered = _recoveries_for_mixed_line(groups, line)
+    if not recovered:
+        return [line]
+    result = [line] if (len(line.text.strip()) == 1 and line.text.strip().isascii()
+                        and line.text.strip().isalpha()) else []
+    known = [old for old in existing if old is not line]
+    for candidate in recovered:
+        if not _same_spatial_text(candidate, known):
+            result.append(candidate)
+    return result
+
+
+def _is_icon_like_single_cjk(line):
+    return (len(line.text.strip()) == 1 and _is_cjk_char(line.text.strip())
+            and line.h > line.w * 1.2 and line.h > 60 and line.score < _OCR_STRIP_MIN_SCORE)
+
+
+def _filter_main_icon_glyphs(engine, img_bgr, lines):
+    kept = []
+    for line in lines:
+        if not _is_icon_like_single_cjk(line):
+            kept.append(line)
+            continue
+        groups = _recover_tall_line(engine, img_bgr, line)
+        # Keep a low-score single CJK result only if a horizontal strip supports it.
+        if line.text in groups and len(groups[line.text]["bands"]) >= 2:
+            kept.append(line)
+    return kept
+
+
+def ocr_rapid(img_bgr):
+    from rapidocr_onnxruntime import RapidOCR
+    if not hasattr(ocr_rapid, "engine"):
+        ocr_rapid.engine = RapidOCR(intra_op_num_threads=4, inter_op_num_threads=1)
+    engine = ocr_rapid.engine
+    main_lines = _ocr_items_to_lines(_rapidocr_call(engine, img_bgr))
+    lines = _filter_main_icon_glyphs(engine, img_bgr, main_lines)
+    mixed_main = [ln for ln in lines if _is_short_tall_mixed_line(ln)]
+    for suspect in mixed_main:
+        replacement = _supplement_or_replace_mixed(engine, img_bgr, suspect, lines)
+        if replacement != [suspect]:
+            index = next((i for i, ln in enumerate(lines) if ln is suspect), None)
+            if index is not None:
+                lines[index:index + 1] = replacement
+
+    height, width = img_bgr.shape[:2]
+    if max(width, height) >= _OCR_TILE_TRIGGER_SIDE:
+        supplements = []
+        for x, y, tile_w, tile_h in _ocr_tiles(width, height):
+            # 不再对整页大小的单 tile 重跑。
+            if tile_w == width and tile_h == height:
+                continue
+            crop = (x, y, tile_w, tile_h)
+            try:
+                tile_result = _rapidocr_call(engine, img_bgr[y:y + tile_h, x:x + tile_w])
+                candidates = _ocr_items_to_lines(tile_result, x, y)
+            except Exception:
+                continue
+            for candidate in candidates:
+                if candidate.score < _OCR_TILE_MIN_SCORE:
+                    continue
+                # A lone Chinese character from an image tile is commonly an icon stroke.
+                if len(candidate.text) == 1 and _is_cjk_char(candidate.text):
+                    continue
+                if not _tile_candidate_is_complete(candidate, crop, img_bgr.shape):
+                    continue
+                # 任何整页行对该位置已有覆盖时都保留整页版本，避免用裁切后的行替换。
+                if any(_box_overlap_ratio(candidate, main) >= 0.25 for main in lines):
+                    continue
+                # 重叠 tile 的同一文字只补一次；比较框的空间重合，不拼接相邻栏文字。
+                if any(_box_overlap_ratio(candidate, prior) >= 0.65
+                       for prior in supplements):
+                    continue
+                if _is_short_tall_mixed_line(candidate):
+                    mixed = _supplement_or_replace_mixed(engine, img_bgr, candidate,
+                                                         lines + supplements)
+                    if mixed == [candidate]:
+                        supplements.append(candidate)
+                    else:
+                        supplements.extend(mixed)
+                else:
+                    supplements.append(candidate)
+        lines.extend(supplements)
     return lines
 
 
@@ -465,7 +694,47 @@ def run_ocr(img_bgr, engine, lang):
 # ----------------------------------------------------------------------------
 # 第 2 步：分析每行文字的颜色 / 字号 / 粗细，同时得到"笔画掩膜"
 # ----------------------------------------------------------------------------
+def _refine_short_glyph(img_bgr, ln):
+    """定位被上方图标撑大的一字母框；须有明确的参考字形匹配才收紧。"""
+    if not (len(ln.text) == 1 and ln.text.isascii() and ln.text.isalnum()
+            and ln.h > 60 and ln.h > 1.2 * ln.w):
+        return False
+    roi = img_bgr[max(0, ln.y):ln.y + ln.h, max(0, ln.x):ln.x + ln.w]
+    if roi.size == 0:
+        return False
+    rh, rw = roi.shape[:2]
+    _, labels, _ = cv2.kmeans(roi.reshape(-1, 3).astype(np.float32), 2, None,
+                              (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0),
+                              3, cv2.KMEANS_PP_CENTERS)
+    candidates = []
+    for color in (0, 1):
+        n, components, stats, _ = cv2.connectedComponentsWithStats(
+            (labels.reshape(rh, rw) == color).astype(np.uint8))
+        for i in range(1, n):
+            x, y, w, h, area = (int(v) for v in stats[i])
+            if w < 4 or h < max(8, 0.1 * rh) or area < 15 or w > 0.85 * rw or h > 0.85 * rh:
+                continue
+            glyph = components[y:y + h, x:x + w] == i
+            score = 0.0
+            for family in ("sans", "serif"):
+                for bold in (False, True):
+                    reference = _render_line_mask(ln.text, h, w, family, bold, False)
+                    if reference is not None:
+                        score = max(score, float((glyph & reference).sum()) / max(1, int((glyph | reference).sum())))
+            candidates.append((score, x, y, w, h))
+    candidates.sort(reverse=True)
+    if not candidates or candidates[0][0] < 0.72:
+        return False
+    if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.08:
+        return False
+    _, x, y, w, h = candidates[0]
+    ln.x, ln.y, ln.w, ln.h = max(0, ln.x) + x, max(0, ln.y) + y, w, h
+    ln.chars = [(ln.x, ln.x + w)]
+    return True
+
+
 def analyze_line(img_bgr, ln, full_mask):
+    _refine_short_glyph(img_bgr, ln)
     H, W = img_bgr.shape[:2]
     pad = max(3, int(ln.h * 0.25))
     x0, y0 = max(0, ln.x - pad), max(0, ln.y - pad)
@@ -530,7 +799,11 @@ def analyze_line(img_bgr, ln, full_mask):
         before = int(ink[cy0:cy1, cxa:cxb].sum())
         after = int((ink & near_text)[cy0:cy1, cxa:cxb].sum())
         if before and after >= 0.5 * before and (ink & ~near_text).sum() >= 0.08 * ink.sum():
-            ink &= near_text
+            # OCR 框内可能有另一种文字色（蓝色标题里的橙色重点词）。
+            # 颜色筛选只约束框外的杂色，不能把框内的真实字形删掉。
+            text_core = np.zeros(ink.shape, bool)
+            text_core[cy0:cy1, cxa:cxb] = True
+            ink &= near_text | text_core
     if ink.sum() < 8:
         return False
 
@@ -591,7 +864,9 @@ def analyze_line(img_bgr, ln, full_mask):
 def _split_runs(ln, roi, ink, solid, dist, x0, scale, bg):
     """返回 [(文字, 颜色, 是否加粗, 字号像素), ...]。只有一种颜色时就是一段。"""
     whole = [(ln.text, ln.color, ln.bold, ln.size_px)]
-    strong = ink & (dist >= np.percentile(dist[ink], 40))
+    # 不能按全行的颜色距离分位数取样：深蓝文字占多数时，
+    # 橙色等较浅的重点词会全部被排除，后续便无法分出第二种颜色。
+    strong = ink & (dist >= max(22.0, 0.25 * float(np.percentile(dist[ink], 95))))
     px = roi[strong]
     if len(ln.text) < 2 or len(px) < 40:
         return whole
@@ -1002,7 +1277,8 @@ def audit_lines(img_bgr, lines, full_mask):
         # 大字两种字体都对不上：书法 / 艺术字。小字对不上多半是识别时混进了符号，仍按文字处理
         if os.environ.get("AUDITDBG"):
             print("   audit %-5s fit %.2f contrast %s  %s" % (ln.family, s["fit"], "%.2f" % s["contrast"] if s.get("contrast") is not None else " -- ", ln.text[:16]))
-        if ln.audit < 0.36 and ln.size_px >= 40 and len(ln.text) >= 2 and not getattr(ln, "manual", False):
+        # 字体相似度不足不能推翻高置信的文字识别，否则粗标题会悄悄变回图片。
+        if ln.audit < 0.36 and ln.score < 0.85 and ln.size_px >= 40 and len(ln.text) >= 2 and not getattr(ln, "manual", False):
             dropped.append(ln)
     # 同字号、同颜色的一批小字（并列的卡片、列表）字体统一：明显的少数派改成多数派
     smalls = [ln for ln in lines if ln.ink and ln.size_px < 28 and getattr(ln, "family", None) and not ln.text.isascii()]
@@ -1224,6 +1500,58 @@ def fix_number_columns(lines):
                 b.text, b.chars = want, None
 
 
+_ICON_GLYPHS = set("品田回口日目囗器圆图昌吕串宫国四□■●◆◇○◎☐▢⊞⌗#")
+
+
+def strip_icon_glyph(img_bgr, lines):
+    """行首被认成字的小图标（"88" 四方格图标认成"品"、方框图标认成"口"）：
+    第一个"字"是个像图形的单字、后面隔着空格才是正文，并且图上它和正文之间确实空出一截 → 把它从这行里去掉，
+    留给图标那一步去抠。返回去掉的个数"""
+    n = 0
+    for ln in lines:
+        t = ln.text
+        if len(t) < 4 or t[0] not in _ICON_GLYPHS or not t[1].isspace() or getattr(ln, "manual", False):
+            continue
+        rest = t[1:].lstrip()
+        if len(rest) < 2:
+            continue
+        x0, y0, x1, y1 = int(ln.x), int(ln.y), int(ln.x + ln.w), int(ln.y + ln.h)
+        roi = img_bgr[y0:y1, x0:x1].astype(np.float32)
+        if roi.size == 0:
+            continue
+        edge = np.concatenate([roi[0], roi[-1], roi[:, 0], roi[:, -1]])
+        ink = np.linalg.norm(roi - np.median(edge, axis=0), axis=2) > 40
+        cols = ink.any(axis=0)
+        # 第一段笔画 + 后面的空白
+        xs = np.where(cols)[0]
+        if not len(xs):
+            continue
+        h = ln.h
+        a = xs[0]
+        b = a
+        while True:                                            # 图标自己的笔画之间的小缝（四方格之间）不算断开
+            while b < len(cols) and cols[b]:
+                b += 1
+            nxt = b
+            while nxt < len(cols) and not cols[nxt]:
+                nxt += 1
+            if nxt < len(cols) and nxt - b < 0.15 * h:
+                b = nxt
+                continue
+            break
+        gap_end = nxt
+        if not (0.5 * h <= b - a <= 1.3 * h and gap_end - b >= 0.3 * h and gap_end < len(cols)):
+            continue
+        cut = x0 + gap_end
+        ln.text = rest
+        ln.w = int(ln.x + ln.w - cut)
+        ln.x = int(cut)
+        if ln.chars:
+            ln.chars = [c for c in ln.chars if c[0] >= cut - 2][-len(rest):] if len(ln.chars) > len(rest) else None
+        n += 1
+    return n
+
+
 def strip_side_bars(img_bgr, lines):
     """标题旁边的竖色块（"▌目录"、"04 ▌听百讲"中间那一竖）常被识别成"1""I""|""■"。
     逐个检查这些字：如果它其实是一根几乎实心的竖条，就不是字，从这行里去掉（色块留在底图里）。"""
@@ -1234,11 +1562,9 @@ def strip_side_bars(img_bgr, lines):
         for k, c in enumerate(ln.text):
             if c not in "1Il|丨■▌▍█":
                 continue
-            if c in "1Il" and k + 1 < len(ln.text) and ln.text[k + 1].isdigit():
-                run = len(ln.text[k + 1:]) - len(ln.text[k + 1:].lstrip("0123456789"))
-                if run < 2:
-                    continue                                   # "10"里的 1（后面只跟一位数字）：是数字，不是色块
-                # "108"：章节号一般两位，多出来的那个 1 是前面的竖色块
+            if c in "1Il" and any(ch.isascii() and ch.isalnum()
+                                  for ch in ln.text[max(0, k - 1):k] + ln.text[k + 1:k + 2]):
+                continue                                       # KPI、IQC 和数字里的竖笔画是正文，不能当装饰删掉
             cx0, cx1 = ln.chars[k]
             roi = img_bgr[ln.y:ln.y + ln.h, max(0, cx0 - 2):cx1 + 2].astype(np.float32)
             if roi.size == 0:
@@ -1640,6 +1966,7 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
                 and x > 1 and y > 1 and x + w < W - 1 and y + h < H - 1)
 
     masks = []                                                 # 每个图标一张整页大小的布尔掩膜
+    parts = []                                                 # 单独看太细太小的零件（柱状图图标的一根根柱子）
     too_big_all = np.zeros((H, W), bool)                       # 所有"太大的色块"（色带、底板）
     for fam in families:
         m = (fg & fam).astype(np.uint8)
@@ -1654,6 +1981,8 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
                 taken |= lab == i
             elif max(w, h) > max_side:
                 too_big |= lab == i
+            elif max(w, h) >= 0.5 * min_side and area >= 0.5 * w * h and area >= 20:
+                parts.append(lab == i)
         # 再从"太大"的块里找被细线连着的实心图标
         too_big_all |= too_big
         solid = cv2.morphologyEx((too_big).astype(np.uint8), cv2.MORPH_OPEN, open_k)
@@ -1664,6 +1993,17 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
                 grown = cv2.dilate((lab == i).astype(np.uint8), open_k) > 0
                 masks.append(grown & too_big)
 
+    # 几根挨得很近的零件拼成一个合格大小的图形：当成一个图标候选（单根柱子太细，过不了尺寸关）
+    pgap = max(5, W // 250)
+    def small_mask(mk):
+        return max(cv2.boundingRect(mk.astype(np.uint8))[2:]) <= 0.04 * W
+    parts = [mk for mk in parts if tm[mk].mean() < 0.3]        # 字的笔画不算零件（环形箭头中间的 "PDCA"）
+    small = [mk for mk in masks if small_mask(mk)]             # 最高的那根柱子自己够大，矮的几根要并到它身上
+    masks = [mk for mk in masks if not small_mask(mk)]
+    for mk in _merge_close(small + list(parts), gap=pgap, max_side=max_side):
+        x, y, w, h = cv2.boundingRect(mk.astype(np.uint8))
+        if ok(x, y, w, h) and (any((mk & s).any() for s in small) or cv2.connectedComponents(mk.astype(np.uint8))[0] - 1 >= 3):
+            masks.append(mk)
     masks = [mk for mk in masks if tm[mk].mean() < 0.3]         # 文字块不要
 
     # 第三类：深色形状上的浅色图标（标题色带里的白色小图标）。上面按"颜色鲜明"找，找不到白色的
@@ -1691,7 +2031,11 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
     flat_bg = (bg_hsv[..., 2] > 225) & (bg_hsv[..., 1] < 40)   # 只在浅色、干净的底上找（照片、色带上不找）
     # 其他图标边缘的抗锯齿像素也"比底色深一点"，会形成一圈假的淡彩轮廓；离鲜明颜色 3 像素以内的不算
     near_vivid = cv2.dilate((fg | (light & on_dark)).astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
-    pale = (diff > 26) & flat_bg & ~fg & ~light & ~tm & ~near_vivid
+    # Keep low-saturation, near-white shapes when they differ from the local
+    # background. The separate light-mask pass is for white marks on dark
+    # backgrounds; excluding all of those pixels here loses pale outlines and
+    # the light bars of otherwise multicolour icons.
+    pale = (diff > 26) & flat_bg & ~fg & ~tm & ~near_vivid
     pale_u8 = cv2.morphologyEx(pale.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     n, lab, stats, _ = cv2.connectedComponentsWithStats(pale_u8, connectivity=8)
     pale_masks = []
@@ -1708,8 +2052,29 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
     pale_masks = _merge_close(pale_masks, gap=max(5, W // 140), max_side=max_side)
     def pale_ok(mk):
         x, y, w, h = cv2.boundingRect(mk.astype(np.uint8))
-        if not ok(x, y, w, h) or mk.sum() < 0.18 * w * h:        # 太稀疏的（弧线、虚线箭头）不是图标
+        if not ok(x, y, w, h):
             return False
+        dense = mk.sum() >= 0.18 * w * h
+        if not dense:
+            # A closed, pale outline can be sparse while still enclosing a
+            # complete icon. Require a substantial interior hole so isolated
+            # arcs and dotted lines remain excluded.
+            contours, hierarchy = cv2.findContours(mk.astype(np.uint8), cv2.RETR_CCOMP,
+                                                    cv2.CHAIN_APPROX_SIMPLE)
+            closed_outline = False
+            if hierarchy is not None:
+                for i, contour in enumerate(contours):
+                    child = hierarchy[0][i][2]
+                    if child >= 0 and cv2.contourArea(contour) >= 0.45 * w * h:
+                        while child >= 0:
+                            if cv2.contourArea(contours[child]) >= 0.25 * w * h:
+                                closed_outline = True
+                                break
+                            child = hierarchy[0][child][0]
+                    if closed_outline:
+                        break
+            if not closed_outline:
+                return False
         px = img_bgr[mk].astype(np.float32)                    # 淡彩图标是单一颜色的；颜色杂的是阴影、渐变、照片的一角
         return (np.linalg.norm(px - np.median(px, axis=0), axis=1) < 38).mean() >= 0.8
     def pale_grow(mk, vivid=False):
@@ -1737,6 +2102,27 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
         out[y0:y1, x0:x1] |= grown
         return out
     pale_masks = [pale_grow(mk) for mk in pale_masks if pale_ok(mk)]
+    def part_of_big(mk):
+        # 浅色地图这类大幅淡色图形：一块大陆旁边一大片都是同样的颜色；真的淡彩图标四周是底色（卡片边框那种细线不算）
+        x, y, w, h = cv2.boundingRect(mk.astype(np.uint8))
+        filled = np.zeros((h, w), np.uint8)
+        cs, _ = cv2.findContours(mk[y:y + h, x:x + w].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(filled, cs, -1, 1, cv2.FILLED)
+        if filled.mean() > 0.8:
+            return False                                       # 方方正正的浅色底板（图标底下的圆角方块）不是地图碎块
+        e = max(W // 12, max(w, h))
+        x0, y0, x1, y1 = max(0, x - e), max(0, y - e), min(W, x + w + e), min(H, y + h + e)
+        col = np.median(img_bgr[mk].astype(np.float32), axis=0)
+        same = np.linalg.norm(img_bgr[y0:y1, x0:x1].astype(np.float32) - col, axis=2) < 25
+        same &= ~tm[y0:y1, x0:x1] & ~pale_lines[y0:y1, x0:x1]
+        same &= cv2.dilate(mk[y0:y1, x0:x1].astype(np.uint8), np.ones((15, 15), np.uint8)) == 0
+        # 看连成一整片的最大那块：一排同色的淡彩图标彼此分开，每块都不大；地图的大陆是一大整片
+        nn, _, st, _ = cv2.connectedComponentsWithStats(same.astype(np.uint8), connectivity=8)
+        biggest = int(st[1:, 4].max()) if nn > 1 else 0
+        if os.environ.get("PALEDBG"):
+            print("   pale part_of_big", (x, y, w, h), biggest, int(mk.sum()))
+        return biggest > max(1.5 * mk.sum(), (W / 30) ** 2)
+    pale_masks = [mk for mk in pale_masks if not part_of_big(mk)]
 
     # 位置很近的碎块合并成一个图标（比如由几笔组成的线条图标）
     gap = max(3, W // 330)                                     # 合并距离取小：按最小单元识别，挨得很近的笔画才并成一个
@@ -1765,6 +2151,39 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
                 boxes[j] = (ux, uy, uw, uh)
                 break
 
+    # A complete multicolour icon is often split into a vivid candidate (the
+    # arrow and dark bars) plus pale candidates (the light bars). Attach pale
+    # fragments that sit inside a vivid candidate's bounds so the group is
+    # scored and exported as one source-colour image.
+    pale_left = []
+    fragment_gap = max(4, W // 220)
+    for pale_mk in pale_masks:
+        px, py, pw, ph = cv2.boundingRect(pale_mk.astype(np.uint8))
+        matches = []
+        for j, base_mk in enumerate(masks):
+            bx, by, bw, bh = cv2.boundingRect(base_mk.astype(np.uint8))
+            iw = max(0, min(px + pw, bx + bw) - max(px, bx))
+            ih = max(0, min(py + ph, by + bh) - max(py, by))
+            overlap = iw * ih / float(max(1, pw * ph))
+            dx = max(0, max(px, bx) - min(px + pw, bx + bw))
+            dy = max(0, max(py, by) - min(py + ph, by + bh))
+            ux, uy = min(px, bx), min(py, by)
+            uw, uh = max(px + pw, bx + bw) - ux, max(py + ph, by + bh) - uy
+            contained = px >= bx and py >= by and px + pw <= bx + bw and py + ph <= by + bh
+            small_fragment = (pw <= 0.75 * bw and ph <= 0.75 * bh
+                              and pale_mk.sum() <= 0.25 * max(1, bw * bh))
+            base_fill = base_mk.sum() / float(max(1, bw * bh))
+            compact_round = (0.85 <= bw / float(max(1, bh)) <= 1.18 and base_fill >= 0.65)
+            if (small_fragment and (contained or not compact_round) and max(uw, uh) <= max_side
+                    and (overlap >= 0.5 or (dx <= fragment_gap and dy <= fragment_gap))):
+                matches.append((overlap, -(dx + dy), j))
+        if matches:
+            _, _, j = max(matches)
+            masks[j] |= pale_mk
+        else:
+            pale_left.append(pale_mk)
+    pale_masks = pale_left
+
     covered = np.zeros((H, W), np.uint8)
     for mk in masks:                                           # 彩色图标连同内部（填洞后）的范围
         cs, _ = cv2.findContours(mk.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -1778,6 +2197,17 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
     masks = masks + pale_masks
     icons, fills, erase = [], [], np.zeros((H, W), np.uint8)
     for mi, mk in enumerate(masks):
+        # 分割阈值会在同色笔画内部留下缺口；只在已有密实零件的框内补回原图同色像素。
+        count, parts, stats, _ = cv2.connectedComponentsWithStats(mk.astype(np.uint8), connectivity=8)
+        for part in range(1, count):
+            px, py, pw, ph, area = map(int, stats[part])
+            if min(pw, ph) < 8 or area < .45 * pw * ph:
+                continue
+            component = parts[py:py + ph, px:px + pw] == part
+            source = img_bgr[py:py + ph, px:px + pw].astype(np.float32)
+            color = np.median(source[component], axis=0)
+            same = np.linalg.norm(source - color, axis=2) < 28
+            mk[py:py + ph, px:px + pw] |= same & ~tm[py:py + ph, px:px + pw]
         filled = np.zeros((H, W), np.uint8)                    # 填掉内部的洞：圆形图标里的白色图案也算图标
         cs, _ = cv2.findContours(mk.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(filled, cs, -1, 255, cv2.FILLED)
@@ -1814,6 +2244,8 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
                 score, why = min(score, 40), why + " · 淡彩图标要求 70 分以上"
             else:
                 why += " · 淡彩图标"
+        elif mi < n_dark and w >= 0.08 * W and (filled[y:y + h, x:x + w] > 0).mean() >= 0.985:
+            score, why = min(score, 30), why + " · 方方正正的大色块（表格的格子）"
         elif mi >= n_dark:                                     # 浅色图标：四周得真的是深色底，否则只是浅色背景的一块
             rh = cv2.cvtColor(np.clip(rpx, 0, 255).astype(np.uint8).reshape(-1, 1, 3), cv2.COLOR_BGR2HSV).reshape(-1, 3) if len(rpx) else np.zeros((0, 3))
             darkfrac = float(((rh[:, 2] < 185) | (rh[:, 1] > 95)).mean()) if len(rh) else 0.0
@@ -1821,6 +2253,8 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
                 score, why = min(score, int(40 * darkfrac)), why + " · 四周不是深色底"
         # 紧贴着文字的色块：多半是文字底下那条色带被字隔出来的一段，不是图标（真图标和旁边的字之间总有一点空隙）
         near_ring = (cv2.dilate(sub, np.ones((13, 13), np.uint8)) > 0) & (sub == 0)
+        if (filled[y:y + h, x:x + w] > 0).mean() < 0.6:        # 空心的图形（环形箭头）：圈在中间的字不算紧贴，色带才是字在旁边
+            near_ring[y - ry0:y - ry0 + h, x - rx0:x - rx0 + w] = False
         touch = float(tm[ry0:ry1, rx0:rx1][near_ring].mean()) if near_ring.any() else 0.0
         if touch > 0.05 and max(w, h) > 1.6 * min_side:
             score, why = min(score, int(40 * (1 - _ramp(touch, 0.05, 0.15)) + 10)), why + " · 紧贴文字（是文字底下的色带）"
@@ -1844,6 +2278,7 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
         if rgba is None:
             rgba = np.dstack([img_bgr[y0:y1, x0:x1], alpha])
         ic = Icon(x0, y0, rgba, "图标", (x, y, w, h), score, why)
+        ic.light = n_dark <= mi < n_pale                       # 深色底上的浅色图标
         if score < 35:
             if rejected is not None and score >= 15:
                 rejected.append(ic)                            # 分数不够：不抠，但记下来给页面显示
@@ -1867,7 +2302,10 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
         inner = [j for j, o in enumerate(icons)
                  if j != i and inside_frac(o.box, ic.box) > 0.4 and o.box[2] * o.box[3] <= 0.6 * area
                  and "淡彩图标要求" not in o.why]         # 没及格的淡彩候选不算数
-        if not inner:
+        if not inner or ic.score < ICON_KEEP_SCORE:            # 自己都没及格的外框，不能把里面的图标算成它的零件
+            continue
+        if not getattr(ic, "light", False) and any(getattr(icons[j], "light", False) for j in inner):
+            dropped[i] = "里面是色带上的浅色图标，它只是色带的一段"
             continue
         # 把里面那些小候选的位置挖掉，看外面这个还剩不剩图案
         rest = cv2.erode(fills[i], np.ones((9, 9), np.uint8)) > 0
@@ -1886,7 +2324,8 @@ def extract_icons(img_bgr, text_mask, exclude=None, rejected=None, avoid=None, p
         if len(same) == len(inner):
             for j in inner:
                 dropped[j] = "是旁边那个图标的一部分"
-        elif not same and any((fills[j] > 0).sum() < 0.86 * icons[j].box[2] * icons[j].box[3] for j in inner):
+        elif not same and any((fills[j] > 0).sum() < 0.86 * icons[j].box[2] * icons[j].box[3]
+                              or getattr(icons[j], "light", False) for j in inner):
             dropped[i] = "里面包着另一个图标，它只是容器"   # 里面确实有个"有形状"的图标
         elif not same:
             for j in inner:                                    # 里面只是些实心小方块：那是镂空图形（比如不等号）笔画之间的空隙
@@ -2337,6 +2776,7 @@ def find_photo_blocks(img_bgr, text_mask):
             if min(w, h) >= minside and area >= 0.8 * w * h:
                 cands.append((int(x), int(y), int(w), int(h), 1))   # 来源 B
     edge_all = (np.sqrt(gx ** 2 + gy ** 2).max(axis=2) / 4.0 > 12)
+    ornate = edge_all & (hl == 0) & (vl == 0)                  # 去掉直线（卡片的边框、分隔线）之后的细节
     # 逐个审核候选
     good = []
     for x, y, w, h, src in cands:
@@ -2360,7 +2800,7 @@ def find_photo_blocks(img_bgr, text_mask):
         band[4:bw_, 4:w - 4] = band[h - bw_:h - 4, 4:w - 4] = True
         band[4:h - 4, 4:bw_] = band[4:h - 4, w - bw_:w - 4] = True
         band &= ~tm[y:y + h, x:x + w]
-        ed = edge_all[y:y + h, x:x + w][band].mean() if band.any() else 0.0
+        ed = (ornate if dom > 0.9 else edge_all)[y:y + h, x:x + w][band].mean() if band.any() else 0.0
         if os.environ.get("PICDBG"):
             print("   photo?", (x, y, w, h), "dom", round(dom, 2), "border", round(float(ed), 2))
         if dom > 0.45 and ed < 0.25:
@@ -2462,6 +2902,386 @@ def find_photo_blocks(img_bgr, text_mask):
     out = trimmed
     if os.environ.get("PICDBG"):
         print("   photo blocks:", out)
+    return out
+
+
+def find_pale_graphics(img_bgr, text_mask):
+    """找大幅的淡色图形（浅色世界地图这类）：比周围底色深一点、颜色不鲜明、连成一大片而且轮廓不规则。
+    返回布尔掩膜。地图上的小块、定位圆点、海岸线都属于它，不该单独抠成图标"""
+    H, W = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    d = cv2.dilate(gray, np.ones((51, 51), np.uint8)) - gray
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    cand = (d > 8) & (d < 70) & (hsv[..., 1] < 110) & (hsv[..., 2] > 150) & (text_mask == 0)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(cand.astype(np.uint8), connectivity=8)
+    out = np.zeros((H, W), bool)
+    pieces = []
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        # 卡片边框是细线（填充率很低），色带是长条、浅色底板是方块（填充率高）：都不算
+        if a >= 0.003 * W * H and max(w, h) >= 0.08 * W and max(w, h) <= 4 * min(w, h) and 0.1 <= a / (w * h) < 0.6:
+            sel = lab == i
+            if np.median(d[sel]) < 20 or np.median(hsv[..., 1][sel]) < 20:
+                continue                                       # 灰白卡片的阴影、浅灰底：颜色太淡，不是地图那种淡彩
+            cs, _ = cv2.findContours((lab[y:y + h, x:x + w] == i).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            if sum(cv2.arcLength(c, True) for c in cs) < 1.8 * 2 * (w + h):
+                continue                                       # 轮廓规整（方格、卡片）：地图的海岸线曲曲折折，周长长得多
+            pieces.append((a, (x, y, w, h), sel))
+    # 地图总有一块大陆特别大；只有一堆小块（图标连着浅色标签）不算地图。小块离大陆不远才算地图的一部分
+    seeds = [b for a, b, _ in pieces if a >= 0.012 * W * H]
+    for a, (x, y, w, h), sel in pieces:
+        if any(max(sx - (x + w), x - (sx + sw), sy - (y + h), y - (sy + sh)) < 0.15 * W for sx, sy, sw, sh in seeds):
+            out |= sel
+    if out.any():                                              # 地图边上颜色更浅的海岸、小岛也算进来
+        near = cv2.dilate(out.astype(np.uint8), np.ones((W // 28 | 1,) * 2, np.uint8)) > 0
+        out |= near & (d > 4) & (d < 70) & (hsv[..., 1] < 110) & (hsv[..., 2] > 150) & (text_mask == 0)
+    return out
+
+
+def _on_pale_graphic(graphic, box, frac=0.3):
+    """box 紧挨着的一圈里，有多大比例是淡色大图（地图）——真图标摆在干净的卡片底上，地图碎块四周还是地图"""
+    H, W = graphic.shape
+    x, y, w, h = [int(v) for v in box]
+    e = max(6, int(0.25 * max(w, h)))
+    x0, y0, x1, y1 = max(0, x - e), max(0, y - e), min(W, x + w + e), min(H, y + h + e)
+    ring = np.ones((y1 - y0, x1 - x0), bool)
+    ring[y - y0:y - y0 + h, x - x0:x - x0 + w] = False
+    return ring.any() and graphic[y0:y1, x0:x1][ring].mean() > frac
+
+
+_TICK_RE = re.compile(r"^-?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?$|^-?\d+(?:\.\d+)?%?$")
+
+
+def _tick_value(text):
+    t = text.strip().replace(" ", "").replace("，", ",").replace("−", "-").replace("–", "-")
+    if not _TICK_RE.match(t):
+        return None
+    try:
+        return float(t.rstrip("%").replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _tick_chain(items):
+    """items: [(数值, 位置, Line)]。坐标轴刻度的位置和数值成正比、数值等差。
+    在里面找最长的一串这样的刻度（OCR 偶尔漏一个也不怕），返回 (刻度列表, 每单位数值对应的像素, 数值 0 的位置) 或 None"""
+    best = None
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            (v1, p1, _), (v2, p2, _) = items[i], items[j]
+            if v1 == v2 or abs(p2 - p1) < 8:
+                continue
+            k = (p2 - p1) / (v2 - v1)
+            inl = [it for it in items if abs(p1 + (it[0] - v1) * k - it[1]) <= max(4.0, 0.12 * abs(p2 - p1))]
+            vals = sorted({it[0] for it in inl})
+            if len(vals) < 4:
+                continue
+            steps = np.diff(vals)
+            step = steps.min()
+            if step <= 0 or np.abs(steps / step - np.round(steps / step)).max() > 0.05 or (steps / step).max() > 2.5:
+                continue                                       # 刻度是等差的（允许漏掉个别刻度）
+            if vals[0] > 2 * step or vals[-1] <= 0:
+                continue                                       # 坐标轴从 0 附近开始或者跨过 0；年份序列（2021、2022…）不算
+            if best is None or len(inl) > len(best[0]):
+                best = (inl, k, p1 - v1 * k)
+    return best
+
+
+def find_charts(img_bgr, lines):
+    """找柱状图 / 条形图 / 折线图：靠坐标轴上那一串等差的数字刻度，加上从 0 刻度引出的坐标轴线。
+    整个图表（连同里面的数值标签、类别名、轴标题）当成一张图片，里面的字不转成文字。返回 [(x, y, w, h), ...]"""
+    H, W = img_bgr.shape[:2]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    bg = cv2.dilate(gray, np.ones((31, 31), np.uint8))         # 附近最亮的颜色当底色：柱子挨着轴线时也不会把底色拉深
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    ink = ((bg - gray) > 8) | (hsv[..., 1] > 60)               # 轴线常是很淡的灰色细线；轴线压在柱子底下时柱子也算
+    content = ((bg - gray) > 14) | (hsv[..., 1] > 50)
+    nums = [(v, ln) for ln in lines if (v := _tick_value(ln.text)) is not None and ln.h > 0]
+
+    def run_from(prof, start, lo, hi, gap, reach):
+        """一维的"线"：在 start 之后 reach 像素以内开始，往 hi 方向走，允许 gap 像素的断口；返回 (起点, 终点)"""
+        s = next((p for p in range(max(lo, start - 4), min(hi, start + reach)) if prof[p]), None)
+        if s is None:
+            return None, None
+        e, miss = s, 0
+        for p in range(s, hi):
+            if prof[p]:
+                e, miss = p, 0
+            else:
+                miss += 1
+                if miss > gap:
+                    break
+        return s, e
+
+    def finish(rx0, ry0, rx1, ry1, tl, lh):
+        """坐标轴围出的绘图区 → 整张图表的范围：收进紧挨着的字，躲开只压住一部分的字"""
+        plot = content[ry0:ry1, rx0:rx1]
+        if plot.size == 0 or plot.mean() < 0.06:
+            return None                                    # 轴里面基本是空的：不是图表
+        # 把紧挨着的字收进来：类别名、数值标签、轴标题、图表小标题（比图宽的大标题 / 图例不收）
+        members = {id(ln) for ln in tl}
+        above_done = False                                 # 往上只收一层（图表自己的小标题），再往上是卡片的大标题
+        for _ in range(4):
+            grown, top0 = False, ry0
+            for ln in lines:
+                if id(ln) in members:
+                    continue
+                lx0, ly0, lx1, ly1 = ln.x, ln.y, ln.x + ln.w, ln.y + ln.h
+                gx = max(rx0 - lx1, lx0 - rx1, 0)
+                gy = max(ry0 - ly1, ly0 - ry1, 0)
+                m = 0.3 * lh
+                if gx == 0 and gy == 0:
+                    ok = True
+                elif gx == 0:
+                    ok = (gy <= 1.3 * lh and lx0 >= rx0 - m and lx1 <= rx1 + m
+                          and not (above_done and ly1 <= top0))
+                elif gy == 0:
+                    ok = gx <= 1.5 * lh and ly0 >= ry0 - m and ly1 <= ry1 + m
+                else:
+                    ok = False
+                if ok:
+                    members.add(id(ln))
+                    rx0, ry0, rx1, ry1 = min(rx0, lx0), min(ry0, ly0), max(rx1, lx1), max(ry1, ly1)
+                    grown = True
+            above_done = above_done or ry0 < top0
+            if not grown:
+                break
+        p = max(4, int(0.3 * lh))
+        rx0, ry0, rx1, ry1 = max(0, rx0 - p), max(0, ry0 - p), min(W, rx1 + p), min(H, ry1 + p)
+        # 只压住一部分的字（旁边卡片的大标题、图例）：把图的边收回来，不切到它
+        for ln in lines:
+            if id(ln) in members:
+                continue
+            lx0, ly0, lx1, ly1 = ln.x, ln.y, ln.x + ln.w, ln.y + ln.h
+            if min(rx1, lx1) <= max(rx0, lx0) or min(ry1, ly1) <= max(ry0, ly0):
+                continue
+            cut = {"t": ly1 + 1 - ry0, "b": ry1 - ly0 + 1, "l": lx1 + 1 - rx0, "r": rx1 - lx0 + 1}
+            side = min(cut, key=cut.get)
+            if side == "t": ry0 = ly1 + 1
+            elif side == "b": ry1 = ly0 - 1
+            elif side == "l": rx0 = lx1 + 1
+            else: rx1 = lx0 - 1
+        w, h = rx1 - rx0, ry1 - ry0
+        if w < 0.08 * W or h < 0.08 * H or w * h > 0.5 * W * H:
+            return None
+        return int(rx0), int(ry0), int(w), int(h)
+
+    rects = []
+    # 竖着的一列刻度（右对齐）→ 柱状图 / 折线图；横着的一排刻度 → 条形图
+    for vertical in (True, False):
+        groups = []
+        key = (lambda ln: ln.x + ln.w) if vertical else (lambda ln: ln.y + ln.h / 2)
+        for v, ln in sorted(nums, key=lambda t: key(t[1])):
+            for g in groups:
+                if abs(key(g[0][1]) - key(ln)) <= max(8, 0.5 * ln.h):
+                    g.append((v, ln))
+                    break
+            else:
+                groups.append([(v, ln)])
+        for g in groups:
+            if len(g) < 4:
+                continue
+            pos = (lambda ln: ln.y + ln.h / 2) if vertical else (lambda ln: ln.x + ln.w / 2)
+            fit = _tick_chain([(v, pos(ln), ln) for v, ln in g])
+            if fit is None:
+                continue
+            ticks, k, zero = fit
+            if (k > 0) == vertical:
+                continue                                       # 竖轴越往上数值越大，横轴越往右越大
+            tl = [t[2] for t in ticks]
+            lh = float(np.median([ln.h for ln in tl]))
+            x0, y0 = min(ln.x for ln in tl), min(ln.y for ln in tl)
+            x1, y1 = max(ln.x + ln.w for ln in tl), max(ln.y + ln.h for ln in tl)
+            zero = int(round(zero))
+            if vertical:
+                # 0 刻度那一行往右应该有一条横轴线
+                best = None
+                for yy in range(max(0, zero - int(lh)), min(H, zero + int(lh) + 1)):
+                    s, e = run_from(ink[yy], x1 + 2, x1, W, 3, int(lh) + 6)
+                    if s is not None and s - x1 < 0.04 * W and (best is None or e - s > best[1] - best[0]):
+                        best = (s, e)
+                if best is None or best[1] - best[0] < 0.1 * W:
+                    continue
+                rx0, ry0, rx1, ry1 = x0, y0, best[1], max(y1, zero + 3)
+            else:
+                # 0 刻度那一列往上应该有一条竖轴线
+                best = None
+                for xx in range(max(0, zero - int(lh)), min(W, zero + int(lh) + 1)):
+                    col = ink[::-1, xx]
+                    s, e = run_from(col, H - y0 + 2, H - y0, H, 3, int(lh) + 6)
+                    if s is not None and s - (H - y0) < 0.04 * H and (best is None or e - s > best[1] - best[0]):
+                        best = (s, e)
+                if best is None or best[1] - best[0] < 0.08 * H:
+                    continue
+                rx0, ry0, rx1, ry1 = min(x0, zero - 3), H - 1 - best[1], x1, y1
+            r = finish(rx0, ry0, rx1, ry1, tl, lh)
+            if r is not None and not any(_iou(r, o) > 0.5 for o in rects):
+                rects.append(r)
+    # 环形图：一圈粗环，分成几段不同的颜色，中间是空的（常写着数字）
+    blur = cv2.medianBlur(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), 5)
+    circles = cv2.HoughCircles(blur, cv2.HOUGH_GRADIENT, dp=1.5, minDist=0.05 * W, param1=100, param2=40,
+                               minRadius=int(0.03 * W), maxRadius=int(0.12 * W))
+    angles = np.deg2rad(np.arange(0, 360, 5))
+    def ring(cx, cy, rr):
+        xs = np.clip((cx + rr * np.cos(angles)).astype(int), 0, W - 1)
+        ys = np.clip((cy + rr * np.sin(angles)).astype(int), 0, H - 1)
+        return img_bgr[ys, xs].astype(np.float32)
+    for cx, cy, r in ([] if circles is None else circles[0]):
+        out = np.median(ring(cx, cy, 2.2 * r), axis=0)         # 环外的底色
+        steps = np.arange(0.5, 2.0, 0.04)                      # 找到的可能是环的内圈，也可能是外圈
+        filled = [float((np.linalg.norm(ring(cx, cy, k * r) - out, axis=1) > 12).mean()) for k in steps]
+        band = [k for k, v in zip(steps, filled) if v >= 0.85]
+        if len(band) < 3 or max(band) - min(band) < 0.14 * max(band) or filled[0] > 0.5:   # 环太细（图标的圆框）或者中间是满的（圆形图标底）
+            continue
+        if max(band) - min(band) > 0.04 * (len(band) - 1) + 0.01:
+            continue                                           # 环是连续的一整圈，中间不断开
+        if float((np.linalg.norm(ring(cx, cy, (max(band) + 0.12) * r) - out, axis=1) > 12).mean()) > 0.5:
+            continue                                           # 环外面应该马上回到底色
+        px = ring(cx, cy, float(np.mean(band)) * r)
+        px = px[np.linalg.norm(px - out, axis=1) > 12]
+        ctr = np.median(px, axis=0)
+        far = np.linalg.norm(px - ctr, axis=1) > 25
+        if not 0.1 <= far.mean() <= 0.9:                       # 整圈一个颜色：是圆圈，不是分段的环形图
+            continue
+        if (np.linalg.norm(np.diff(px, axis=0), axis=1) > 25).sum() > 8:
+            continue                                           # 颜色一路乱跳：是碰巧圈到的画面，环形图是一段一段的
+        q = int(max(band) * r) + 6
+        b = (max(0, int(cx) - q), max(0, int(cy) - q), 2 * q, 2 * q)
+        def cuts(ln):                                          # 切到半行字：这个圈套住的是别的内容
+            ix = min(b[0] + b[2], ln.x + ln.w) - max(b[0], ln.x)
+            iy = min(b[1] + b[3], ln.y + ln.h) - max(b[1], ln.y)
+            return ix > 0 and iy > 0 and ix * iy < 0.9 * ln.w * ln.h
+        if not any(_iou(b, o) > 0.5 for o in rects) and not any(cuts(ln) for ln in lines):
+            rects.append(tuple(int(v) for v in b))
+    # 矩阵图：左边一列"高 / 中 / 低"、底下一排"低 / 中 / 高"，两条轴围成一个 L
+    grade = {"低": 0, "中": 1, "高": 2, "Low": 0, "Medium": 1, "High": 2}
+    marks = [(grade[ln.text.strip()], ln) for ln in lines if ln.text.strip() in grade and ln.h > 0]
+    def ladder(vertical):
+        out = []
+        key = (lambda ln: ln.x + ln.w / 2) if vertical else (lambda ln: ln.y + ln.h / 2)
+        pos = (lambda ln: ln.y + ln.h / 2) if vertical else (lambda ln: ln.x + ln.w / 2)
+        for v, ln in marks:
+            g = [(v2, l2) for v2, l2 in marks if abs(key(l2) - key(ln)) <= max(8, 0.6 * ln.h)]
+            if len({v2 for v2, _ in g}) < 3 or len(g) != len({v2 for v2, _ in g}):
+                continue
+            g.sort(key=lambda t: pos(t[1]))
+            vals = [v2 for v2, _ in g]
+            if vals != sorted(vals, reverse=vertical):         # 竖轴从上往下 高→低，横轴从左往右 低→高
+                continue
+            gaps = np.diff([pos(l2) for _, l2 in g])
+            if gaps.min() < 2 * ln.h or gaps.max() > 1.5 * gaps.min():
+                continue                                       # 等距排开
+            if not any(o[0] is g[0][1] for o in out):
+                out.append([l2 for _, l2 in g])
+        return out
+    for col in ladder(True):
+        for row in ladder(False):
+            lh = float(np.median([ln.h for ln in col + row]))
+            cx1 = max(ln.x + ln.w for ln in col)
+            cy1 = max(ln.y + ln.h for ln in col)
+            rx0_ = min(ln.x for ln in row)
+            ry0_ = min(ln.y for ln in row)
+            # L 形：横轴在竖轴下方不远处，并且在它右边
+            if not (cy1 <= ry0_ + lh and ry0_ - cy1 < 5 * lh and cx1 <= rx0_ + lh and rx0_ - cx1 < 6 * lh):
+                continue
+            tl = col + row
+            r = finish(min(ln.x for ln in col), min(ln.y for ln in col),
+                       max(ln.x + ln.w for ln in row), max(ln.y + ln.h for ln in row), tl, lh)
+            if r is not None:
+                # 格子、轴箭头会伸出刻度字的范围：四条边往外推，直到边上那一行 / 列基本是空的
+                x0, y0, x1, y1 = r[0], r[1], r[0] + r[2], r[1] + r[3]
+                lim = int(0.08 * W)
+                for _ in range(lim):
+                    moved = False
+                    if x1 < W and content[y0:y1, x1].mean() > 0.05: x1 += 1; moved = True
+                    if x0 > 0 and content[y0:y1, x0 - 1].mean() > 0.05: x0 -= 1; moved = True
+                    if y0 > 0 and content[y0 - 1, x0:x1].mean() > 0.05: y0 -= 1; moved = True
+                    if y1 < H and content[y1, x0:x1].mean() > 0.05: y1 += 1; moved = True
+                    if not moved:
+                        break
+                p = max(4, int(0.3 * lh))
+                x0, y0, x1, y1 = max(0, x0 - p), max(0, y0 - p), min(W, x1 + p), min(H, y1 + p)
+                for ln in lines:                               # 推出去碰到的字（底下的注释）：边收回到它外面
+                    lx0, ly0, lx1, ly1 = ln.x, ln.y, ln.x + ln.w, ln.y + ln.h
+                    if min(x1, lx1) <= max(x0, lx0) or min(y1, ly1) <= max(y0, ly0):
+                        continue
+                    if r[0] <= lx0 and r[1] <= ly0 and lx1 <= r[0] + r[2] and ly1 <= r[1] + r[3]:
+                        continue                               # 本来就在图里的字
+                    if ly0 >= r[1] + r[3] - 2: y1 = min(y1, ly0 - 1)
+                    elif ly1 <= r[1] + 2: y0 = max(y0, ly1 + 1)
+                    elif lx0 >= r[0] + r[2] - 2: x1 = min(x1, lx0 - 1)
+                    elif lx1 <= r[0] + 2: x0 = max(x0, lx1 + 1)
+                r = (x0, y0, x1 - x0, y1 - y0)
+            if r is not None and not any(_iou(r, o) > 0.5 for o in rects):
+                rects.append(r)
+    if os.environ.get("PICDBG"):
+        print("   charts:", rects)
+    return rects
+
+
+def _grow_box(img_bgr, box, text_mask):
+    """框比东西小（笔记本电脑的底座伸出屏幕两边）：四条边往外推，直到外面一圈都是底色"""
+    H, W = img_bgr.shape[:2]
+    x0, y0, x1, y1 = box[0], box[1], box[0] + box[2], box[1] + box[3]
+    e = 24
+    rx0, ry0, rx1, ry1 = max(0, x0 - e), max(0, y0 - e), min(W, x1 + e), min(H, y1 + e)
+    around = np.ones((ry1 - ry0, rx1 - rx0), bool)
+    around[y0 - ry0:y1 - ry0, x0 - rx0:x1 - rx0] = False
+    if not around.any():
+        return box
+    bg = np.median(img_bgr[ry0:ry1, rx0:rx1][around].astype(np.float32), axis=0)
+    off = (np.linalg.norm(img_bgr.astype(np.float32) - bg, axis=2) > 20) & (text_mask == 0)
+    for _ in range(int(0.03 * W)):
+        moved = False
+        if x0 > 0 and off[y0:y1, x0 - 1].sum() >= 3: x0 -= 1; moved = True
+        if x1 < W and off[y0:y1, x1].sum() >= 3: x1 += 1; moved = True
+        if y0 > 0 and off[y0 - 1, x0:x1].sum() >= 3: y0 -= 1; moved = True
+        if y1 < H and off[y1, x0:x1].sum() >= 3: y1 += 1; moved = True
+        if not moved:
+            break
+    return x0, y0, x1 - x0, y1 - y0
+
+
+def find_unclaimed_shapes(photo_src, img_bgr, taken):
+    """img_bgr 上没被任何元素认领、大小和样子都像图标的图形。
+    photo_src 用来判断哪里是大幅照片 / 淡色地图（那里面的东西不算）。返回 [(x, y, w, h), ...]"""
+    H, W = img_bgr.shape[:2]
+    blank = np.zeros((H, W), np.uint8)
+    photo = np.zeros((H, W), bool)
+    for x, y, w, h in find_picture_regions(photo_src, blank):
+        if w * h >= 0.05 * W * H:
+            photo[y:y + h, x:x + w] = True
+    pale = find_pale_graphics(photo_src, blank)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    fg = ((hsv[..., 1] > 110) | (hsv[..., 2] < 90)).astype(np.uint8)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((max(5, W // 250),) * 2, np.uint8))
+    n, lab, st, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
+    lo, hi = int(0.016 * W), int(0.09 * W)
+    out = []
+    for i in range(1, n):
+        x, y, w, h, area = st[i]
+        if not (lo <= max(w, h) <= hi and min(w, h) >= 0.5 * lo and max(w, h) <= 3 * min(w, h)):
+            continue
+        if x == 0 or y == 0 or x + w >= W or y + h >= H:
+            continue
+        sel = lab == i
+        if photo[sel].mean() > 0.3 or pale[y:y + h, x:x + w].mean() > 0.2 or taken[sel].mean() > 0.2:
+            continue
+        # 图标摆在平整的底上；叶子这类装饰的一块，四周还是纹理
+        e = 12
+        x0, y0, x1, y1 = max(0, x - e), max(0, y - e), min(W, x + w + e), min(H, y + h + e)
+        around = np.ones((y1 - y0, x1 - x0), bool)
+        around[y - y0:y - y0 + h, x - x0:x - x0 + w] = False
+        px = img_bgr[y0:y1, x0:x1][around].astype(np.float32)
+        if (np.linalg.norm(px - np.median(px, axis=0), axis=1) < 20).mean() < 0.7:
+            continue
+        # 贴着大色块的一段（色带的角、卡片的边）不算：四周要基本是干净的
+        rx0, ry0 = max(0, x - 6), max(0, y - 6)
+        rim = fg[ry0:y + h + 6, rx0:x + w + 6].copy()
+        rim[y - ry0:y - ry0 + h, x - rx0:x - rx0 + w] = 0
+        if rim.mean() > 0.08:
+            continue
+        out.append((int(x), int(y), int(w), int(h)))
     return out
 
 
@@ -3112,7 +3932,19 @@ def harmonize_accents(lines):
         ln.runs = [(ln.runs[0][0], last[1]) + tuple(ln.runs[0][2:])] + list(ln.runs[1:])
 
 
-def group_lines(lines):
+def _rule_between(img_bgr, a, b):
+    """上下两行字之间有没有一条横线（表格的格线）：有就说明它们在不同的格子里，不能并成一个文本框"""
+    x0, x1 = int(max(a.ink[0], b.ink[0])), int(min(a.ink[2], b.ink[2]))
+    y0, y1 = int(a.ink[3]) + 2, int(b.ink[1]) - 2
+    if x1 - x0 < 10 or y1 - y0 < 3:
+        return False
+    strip = img_bgr[y0:y1, x0:x1].astype(np.float32)
+    bg = np.median(strip.reshape(-1, 3), axis=0)
+    off = np.linalg.norm(strip - bg, axis=2) > 18
+    return bool((off.mean(axis=1) > 0.8).any())
+
+
+def group_lines(lines, img_bgr=None):
     lines = sorted(lines, key=lambda l: (l.y, l.x))
     blocks = []
     for ln in lines:
@@ -3125,7 +3957,8 @@ def group_lines(lines):
             close = 0.9 * ln.size_px < gap < 2.2 * ln.size_px
             left = abs(last.ink[0] - ln.ink[0]) < 0.6 * ln.size_px
             center = abs((last.ink[0] + last.ink[2]) - (ln.ink[0] + ln.ink[2])) / 2 < 0.6 * ln.size_px
-            if same_size and same_style and close and (left or center) and not ln.badge and not last.badge:
+            if (same_size and same_style and close and (left or center) and not ln.badge and not last.badge
+                    and not (img_bgr is not None and _rule_between(img_bgr, last, ln))):
                 target = b
                 if not left and center:
                     b.align = "center"
@@ -3624,7 +4457,7 @@ def _clean_lines(lines, W):
             cy = ln.y + ln.h / 2
             near = any(o is not ln and abs((o.y + o.h / 2) - cy) < 0.6 * ln.h
                        and min(abs(o.x - (ln.x + ln.w)), abs(ln.x - (o.x + o.w))) < 1.5 * ln.h for o in lines)
-            if not near:
+            if not near and ln.score < 0.9:
                 continue
         out.append(ln)
     # 竖排的字（坐标轴旁边的"风险程度"）：拆成一个字一行，这样字号和位置才量得准
@@ -3782,6 +4615,7 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     if n_conf:
         used += f"（形近字纠正 {n_conf} 处）"
     lines = _clean_lines(lines, W)
+    strip_icon_glyph(img, lines)                               # 行首被认成"品""口"的小图标，留给图标那一步
     strip_side_bars(img, lines)
     lines = split_wide_gaps(img, lines)
     fix_number_columns(lines)
@@ -3793,9 +4627,19 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
         nl = Line(e["text"].strip().replace("\n", ""), bx, by, bw, bh)
         nl.manual = True
         lines.append(nl)
+    arrow_regions = []
+    arrow_mask = np.zeros((H, W), np.uint8)
+    if with_icons:
+        lines, arrow_regions = detect_graphic_arrows(img, lines)
+        # 特别细长的多半是下划线、分隔线：留在底图里（真的长箭头留在底图也不损失什么）
+        arrow_regions = [a for a in arrow_regions if max(a.box[2:]) <= 8 * min(a.box[2:])]
+        for arrow in arrow_regions:
+            ax, ay, aw, ah = arrow.box
+            arrow_mask[ay:ay + ah, ax:ax + aw][arrow.mask] = 255
     badges, lines = find_badges(img, lines)                    # 序号先分出来：圆圈归图形，里面的字归文字
     mask = np.zeros((H, W), np.uint8)
     kept = [ln for ln in lines if analyze_line(img, ln, mask) or _manual_fallback(img, ln)]
+    mask[arrow_mask > 0] = 0                                  # 图形箭头不能随相邻文字一起被清理
     tell("text", [[int(l.ink[0]), int(l.ink[1]), int(l.ink[2] - l.ink[0]), int(l.ink[3] - l.ink[1]), int(round(l.score * 100)), l.text] for l in kept])
     zero = np.zeros((H, W), np.uint8)
     # 先用"全部文字"的掩膜找图标和图片，再决定哪些字属于图片内部
@@ -3814,8 +4658,16 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
             pic_mask = cv2.dilate(pic_mask, np.ones((5, 5), np.uint8))
             smooth = cv2.bitwise_and(smooth, pic_mask)
     photo_blocks = []
-    if with_pictures:                                          # 整张照片：先于其他图片规则，照片里的字、小图案都跟着照片走
-        for bx, by, bw, bh in find_photo_blocks(img, mask):
+    if with_pictures:                                          # 整张照片 / 图表：先于其他图片规则，里面的字、小图案都跟着它走
+        charts = find_charts(img, kept)
+        def in_chart(r):                                       # 图表里的一块（一根柱子、一段图例）不是单独的照片
+            return any(max(0, min(r[0] + r[2], c[0] + c[2]) - max(r[0], c[0]))
+                       * max(0, min(r[1] + r[3], c[1] + c[3]) - max(r[1], c[1])) > 0.6 * r[2] * r[3] for c in charts)
+        whole = [(r, "整张照片（里面的字跟着照片走）") for r in find_photo_blocks(img, mask) if not in_chart(r)]
+        whole += [(r, "图表（里面的数字、文字跟着图走）") for r in charts
+                  if not any(_iou(r, o) > 0.5 for o, _ in whole)]
+        for (bx, by, bw, bh), label in whole:
+            photo_blocks.append((bx, by, bw, bh))               # 已提取的照片同样需要保护内部文字
             inside = [k for k, p in enumerate(pics) if bx - 6 <= p.box[0] + p.box[2] / 2 <= bx + bw + 6
                       and by - 6 <= p.box[1] + p.box[3] / 2 <= by + bh + 6]
             if any(pics[k].box[2] * pics[k].box[3] > 1.3 * bw * bh for k in inside):
@@ -3824,13 +4676,14 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
                 continue                                       # 前面已经把这张图完整抠出来了（轮廓更精细），不换
             keep = [k for k in range(len(pics)) if k not in inside]
             pics, pic_sel = [pics[k] for k in keep], [pic_sel[k] for k in keep]
+            if label.startswith("整张照片"):
+                bx, by, bw, bh = photo_blocks[-1] = _grow_box(img, (bx, by, bw, bh), mask)
             filled = _rect_mask(img, bx, by, bw, bh)
             sel = filled > 0
             p = 2
             x0, y0, x1, y1 = max(0, bx - p), max(0, by - p), min(W, bx + bw + p), min(H, by + bh + p)
             alpha = cv2.GaussianBlur(filled[y0:y1, x0:x1], (3, 3), 0)
-            pics.append(Icon(x0, y0, np.dstack([img[y0:y1, x0:x1], alpha]), "图片", (bx, by, bw, bh), 80, "整张照片（里面的字跟着照片走）"))
-            photo_blocks.append((bx, by, bw, bh))
+            pics.append(Icon(x0, y0, np.dstack([img[y0:y1, x0:x1], alpha]), "图片", (bx, by, bw, bh), 80, label))
             pic_sel.append(sel)
         pic_mask = np.zeros((H, W), np.uint8)
         for sel in pic_sel:
@@ -3881,13 +4734,75 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
             pic_mask[cv2.dilate(sel.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0] = 255
             smooth[sel] = 255                                  # 四周是干净底色，抠走后直接平滑填充
     photo_zone = np.zeros((H, W), bool)                        # 贴着页面边缘的照片区域：里面不找淡彩图标
+    big_photo = np.zeros((H, W), bool)                         # 大幅背景照片：整张留在底图里，里面的零件一个都不单独抠
     for px, py, pw, ph in find_picture_regions(img, mask):
         photo_zone[py:py + ph, px:px + pw] = True
+        if pw * ph >= 0.05 * W * H:
+            big_photo[py:py + ph, px:px + pw] = True
+    if with_icons and big_photo.any():
+        arrow_regions = [a for a in arrow_regions if not big_photo[a.box[1] + a.box[3] // 2, a.box[0] + a.box[2] // 2]]
     bars = getattr(_flat_graphics, "bars", None)               # 时间轴和轴上的圆点：留在底图里，不当图标抠
     icon_excl = (pic_mask > 0) | (bars > 0) if bars is not None and bars.shape == pic_mask.shape else pic_mask > 0
+    icon_excl = icon_excl | big_photo
     icons, icon_mask = extract_icons(img, mask, icon_excl, rejected, b_avoid, photo_zone) if with_icons else ([], zero)
+    pale_graphic = find_pale_graphics(img, mask) if with_icons else np.zeros((H, W), bool)
+    if pale_graphic.any():                                     # 地图上的碎块、定位圆点：留在底图里，不单独抠
+        gone = [ic for ic in icons if _on_pale_graphic(pale_graphic, ic.box)]
+        if gone:
+            icons = [ic for ic in icons if not any(ic is g for g in gone)]
+            for ic in gone:
+                bx, by, bw, bh = [int(v) for v in ic.box]
+                icon_mask[max(0, by - 5):by + bh + 5, max(0, bx - 5):bx + bw + 5] = 0
+            for ic in icons:                                   # 挨着的留下的图标，把它自己的范围补回去
+                hh, ww = ic.rgba.shape[:2]
+                a = cv2.dilate((ic.rgba[..., 3] > 8).astype(np.uint8) * 255, np.ones((7, 7), np.uint8))
+                icon_mask[ic.y:ic.y + hh, ic.x:ic.x + ww] = np.maximum(icon_mask[ic.y:ic.y + hh, ic.x:ic.x + ww], a)
+        arrow_regions = [a for a in arrow_regions if not _on_pale_graphic(pale_graphic, a.box)]
     icons = b_icons + icons
     icon_mask = np.maximum(icon_mask, b_erase)
+    for arrow in arrow_regions:
+        ax, ay, aw, ah = arrow.box
+        # 先识别完整图标，再合并箭头；提前排除箭头会把柱状图、设备图拆坏。
+        def duplicate_arrow(element):
+            bx, by, bw, bh = element.box
+            overlap = max(0, min(ax + aw, bx + bw) - max(ax, bx)) * max(0, min(ay + ah, by + bh) - max(ay, by))
+            if bw * bh > 1.5 * aw * ah or overlap < .7 * aw * ah:
+                return False
+            # 包围框重叠还不够：组合图标可能带有箭头以外的圆点、柱子等零件。
+            eh, ew = element.rgba.shape[:2]
+            arrow_only = np.zeros((H, W), np.uint8)
+            arrow_only[ay:ay + ah, ax:ax + aw][arrow.mask] = 255
+            near_arrow = cv2.dilate(arrow_only, np.ones((5, 5), np.uint8))
+            support = element.rgba[..., 3] >= 128
+            covered = near_arrow[element.y:element.y + eh, element.x:element.x + ew] > 0
+            return covered.shape == support.shape and (support & ~covered).sum() <= max(4, .03 * support.sum())
+        icons = [element for element in icons if not duplicate_arrow(element)]
+        # 已经完整包含在配图中的箭头随配图保留，避免重复叠一层。
+        contained = False
+        for element in pics + icons:
+            bx, by, bw, bh = element.box
+            if not (bx <= ax and by <= ay and ax + aw <= bx + bw and ay + ah <= by + bh
+                    and bw * bh > 1.5 * aw * ah):
+                continue
+            if element.kind == "图标" and not element.why.startswith("图形箭头"):
+                contained = True                               # 整个落在一个图标里：是图标的一笔（层叠图标的顶层），不另算箭头
+                break
+            alpha = element.rgba[ay - element.y:ay - element.y + ah,
+                                 ax - element.x:ax - element.x + aw, 3]
+            if alpha.shape == arrow.mask.shape and (alpha[arrow.mask] >= 128).mean() >= 0.9:
+                contained = True
+                break
+        if contained:
+            continue
+        x0, y0, x1, y1 = max(0, ax - 2), max(0, ay - 2), min(W, ax + aw + 2), min(H, ay + ah + 2)
+        alpha = arrow_mask[y0:y1, x0:x1].copy()
+        alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
+        alpha[ay - y0:ay - y0 + ah, ax - x0:ax - x0 + aw][arrow.mask] = 255
+        icons.append(Icon(x0, y0, np.dstack([img[y0:y1, x0:x1], alpha]), "图标",
+                          arrow.box, int(round(100 * arrow.score)), "图形箭头 · " + arrow.direction))
+        full = np.zeros((H, W), np.uint8)
+        full[ay:ay + ah, ax:ax + aw][arrow.mask] = 255
+        icon_mask = np.maximum(icon_mask, cv2.dilate(full, np.ones((7, 7), np.uint8)))
     if edits is not None:
         keep_src = {tuple(int(v) for v in e["src"]) for e in edits if e.get("src")}
         # 图片：清单里没有的不再抠
@@ -3922,25 +4837,92 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
             else:
                 icons.append(el)
                 icon_mask[cv2.dilate(sel.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0] = 255
+    if with_icons and edits is None:                           # 补抠：圆框图标、时间轴上的图标，前面的规则容易漏掉
+        taken = np.maximum(np.maximum(cv2.dilate(mask, np.ones((3, 3), np.uint8)), icon_mask), pic_mask) > 0
+        for e in pics + icons:
+            taken[e.y:e.y + e.rgba.shape[0], e.x:e.x + e.rgba.shape[1]] = True
+        for bx, by, bw, bh in find_unclaimed_shapes(img, img, taken):
+            if min(bw, bh) < 0.02 * W or max(bw, bh) > 1.6 * min(bw, bh):
+                continue
+            el, sel, _ = _manual_element(img, (bx - 3, by - 3, bw + 6, bh + 6), "图标", mask)
+            el.score, el.why = 60, "补抠：没有被别的元素认领的图形"
+            icons.append(el)
+            icon_mask[cv2.dilate(sel.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0] = 255
     tell("icon", [[int(v) for v in ic.box] + [ic.score, ic.why] for ic in icons])
     tell("rejected", [[int(v) for v in ic.box] + [ic.score, ic.why] for ic in rejected])
     pictures = find_picture_regions(img, mask)                 # 贴着画面边缘、没法整张抠出来的照片区域
     free = cv2.dilate(mask, np.ones((5, 5), np.uint8)) == 0
+    elements = pics + icons
+    def text_fits_box(ln, box):
+        if not ln.ink or not box:
+            return False
+        x0, y0, x1, y1 = [int(v) for v in ln.ink]
+        bx, by, bw, bh = [int(v) for v in box]
+        tw, th = x1 - x0, y1 - y0
+        margin = 2
+        return (tw > 0 and th > 0 and bw > 0 and bh > 0
+                and bw * bh >= 3 * tw * th
+                and bx + margin <= x0 and by + margin <= y0
+                and x1 <= bx + bw - margin and y1 <= by + bh - margin)
+
+    def restore_text_in_element(ln, element):
+        if not text_fits_box(ln, element.box) or element.rgba is None or element.rgba.ndim != 3 or element.rgba.shape[2] < 4:
+            return False
+        bx, by, bw, bh = [int(v) for v in element.box]
+        rx, ry = int(element.x), int(element.y)
+        rgba = element.rgba
+        rh, rw = rgba.shape[:2]
+        ex0, ey0, ex1, ey1 = bx - rx, by - ry, bx + bw - rx, by + bh - ry
+        if ex0 < 0 or ey0 < 0 or ex1 > rw or ey1 > rh:
+            return False
+        alpha = rgba[..., 3]
+        component_alpha = alpha[ey0:ey1, ex0:ex1]
+        if component_alpha.size == 0 or float((component_alpha >= 128).mean()) < 0.5:
+            return False
+        opaque = (alpha >= 128).astype(np.uint8)
+        contours, _ = cv2.findContours(opaque, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return False
+        support = np.zeros_like(opaque)
+        cv2.drawContours(support, contours, -1, 1, cv2.FILLED)
+        x0, y0, x1, y1 = [int(v) for v in ln.ink]
+        tx0, ty0, tx1, ty1 = x0 - rx, y0 - ry, x1 - rx, y1 - ry
+        text_support = support[ty0:ty1, tx0:tx1]
+        if text_support.shape != (y1 - y0, x1 - x0) or float((text_support > 0).mean()) < 0.95:
+            return False
+        # The extractor may have made OCR glyphs transparent; restore only this text crop from the source.
+        px0, py0, px1, py1 = max(0, x0 - 1), max(0, y0 - 1), min(W, x1 + 1), min(H, y1 + 1)
+        sx0, sy0, sx1, sy1 = px0 - rx, py0 - ry, px1 - rx, py1 - ry
+        patch_support = support[sy0:sy1, sx0:sx1] > 0
+        patch_rgba = rgba[sy0:sy1, sx0:sx1]
+        source = img[py0:py1, px0:px1]
+        if patch_support.shape != source.shape[:2] or patch_rgba.shape[:2] != source.shape[:2]:
+            return False
+        patch_rgba[..., :3][patch_support] = source[patch_support]
+        patch_rgba[..., 3][patch_support] = 255
+        return True
+
     def inside(ln):
         if ln.badge or getattr(ln, "manual", False):          # 人工补的字一定转成文字
             return False
-        cx, cy = int((ln.ink[0] + ln.ink[2]) / 2), int((ln.ink[1] + ln.ink[3]) / 2)
-        if any(sel[min(H - 1, cy), min(W - 1, cx)] for sel in pic_sel):
-            return True                                        # 在抠出来的图片里：字跟着图片走
-        if any(px <= cx <= px + pw and py <= cy <= py + ph for px, py, pw, ph in pictures):
+        preserved = False
+        for element in elements:
+            if element.kind == "图标" and len(ln.text.strip()) >= 2 and element.box[2] >= 1.8 * element.box[3]:
+                continue                                       # 扁长的标签底板 / 按钮上的字一律转成文字；图标插画里的数字、照片和图表里的字才跟着图走
+            if restore_text_in_element(ln, element):
+                preserved = True
+        if preserved:
             return True
-        return False
+        # Photo regions that stay in the background have no extracted RGBA layer to inspect.
+        return any(text_fits_box(ln, box) for box in photo_blocks + pictures)
     skipped = [ln for ln in kept if inside(ln)]
     if skipped:
         mask = np.zeros((H, W), np.uint8)
-        kept = [ln for ln in kept if not inside(ln) and (analyze_line(img, ln, mask) or _manual_fallback(img, ln))]
+        skipped_ids = {id(ln) for ln in skipped}
+        kept = [ln for ln in kept if id(ln) not in skipped_ids and (analyze_line(img, ln, mask) or _manual_fallback(img, ln))]
     attach_dashes(img, kept, mask)                            # 放在最后：前面可能重建过文字掩膜
     attach_trailing_punct(img, kept, mask)
+    mask[arrow_mask > 0] = 0
     tell("audit")
     unify_sizes(kept)
     art = audit_lines(img, kept, mask)
@@ -3952,10 +4934,22 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     if photo_blocks:                                           # 整张照片里面的小图 / 图标：跟着照片走，不单独再抠一份
         def in_block(ic):
             cx, cy = ic.box[0] + ic.box[2] / 2, ic.box[1] + ic.box[3] / 2
-            return any(bx <= cx <= bx + bw and by <= cy <= by + bh and tuple(ic.box) != (bx, by, bw, bh)
-                       for bx, by, bw, bh in photo_blocks)
+            return any(bx <= cx <= bx + bw and by <= cy <= by + bh and ic.box[2] * ic.box[3] < bw * bh
+                       for bx, by, bw, bh in photo_blocks)      # 只拿掉比它小的：大图不能被里面的小块吞掉
         pics = [p for p in pics if not in_block(p)]
         icons = [ic for ic in icons if not in_block(ic)]
+    for ln in kept:                                            # 字底下同色的横线（重点词的下划线）不是字，留在底图里
+        if not ln.ink or any(c in ln.text for c in "—–-_=~─"):
+            continue
+        ix0, iy0, ix1, iy1 = [int(v) for v in ln.ink]
+        lh = max(8, int(ln.size_px) or iy1 - iy0)
+        ry0, ry1 = int(ln.baseline or iy1) + 2, min(H, iy1 + int(0.5 * lh))    # 基线以下：只剩字的下伸部分，都很窄
+        strip = mask[ry0:ry1, ix0:ix1]
+        if strip.size == 0:
+            continue
+        flat = cv2.morphologyEx((strip > 0).astype(np.uint8), cv2.MORPH_OPEN, np.ones((1, max(6, lh // 2)), np.uint8))
+        if flat.any():
+            strip[cv2.dilate(flat, np.ones((3, 3), np.uint8)) > 0] = 0
     icon_mask = np.maximum(icon_mask, pic_mask)
     icons = pics + icons
     tell("erase")
@@ -3963,7 +4957,8 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
     # 转成文字的那几行如果有一部分压在抠出来的图片上（照片底部的标题横幅），图片里那部分字也要抹掉，
     # 否则图片盖在文字框上面，会出现"原图的字 + 文本框的字"两层重影
     tmask = cv2.dilate(mask, np.ones((5, 5), np.uint8)) > 0
-    for p in pics:
+    tmask[cv2.dilate(arrow_mask, np.ones((3, 3), np.uint8)) > 0] = False
+    for p in icons:                                           # 图标边缘的文字碎片也要清理，避免文字叠两次
         if p.rgba is None:
             continue
         ph, pw = p.rgba.shape[:2]
@@ -3971,7 +4966,28 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
         if sub.shape != (ph, pw) or not sub.any():
             continue
         sub = sub & (p.rgba[:, :, 3] > 0)
-        p.rgba[:, :, :3][sub] = clean[p.y:p.y + ph, p.x:p.x + pw][sub]
+        if not sub.any():
+            continue
+        # 整页 clean 已经抹掉整个图片，不能拿它来填图片内部的文字，
+        # 否则文字下面的图案也会被换成页面底色。用图片自身的邻域补全。
+        fixed, _ = erase_text(p.rgba[:, :, :3], sub.astype(np.uint8) * 255, inpaint)
+        p.rgba[:, :, :3][sub] = fixed[sub]
+    for p in icons:                                           # 叠回去和原图不一样的像素（图标里的白色部分被当成透明了）：按原图补上
+        if p.rgba is None or p.kind != "图标" or p.rgba.shape[2] < 4:
+            continue
+        ph, pw = p.rgba.shape[:2]
+        if p.y < 0 or p.x < 0 or p.y + ph > H or p.x + pw > W:
+            continue
+        alpha = p.rgba[..., 3]
+        cs, _ = cv2.findContours((alpha > 8).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        hull = np.zeros((ph, pw), np.uint8)
+        cv2.drawContours(hull, cs, -1, 1, cv2.FILLED)
+        a = alpha[..., None].astype(np.float32) / 255.0
+        src = img[p.y:p.y + ph, p.x:p.x + pw]
+        comp = p.rgba[..., :3].astype(np.float32) * a + clean[p.y:p.y + ph, p.x:p.x + pw].astype(np.float32) * (1 - a)
+        wrong = (np.linalg.norm(comp - src.astype(np.float32), axis=2) > 30) & (hull > 0) & ~tmask[p.y:p.y + ph, p.x:p.x + pw]
+        p.rgba[..., :3][wrong] = src[wrong]
+        p.rgba[..., 3][wrong] = 255
     if bars is not None and bars.shape == mask.shape:          # 时间轴留在底图里：抹掉旁边的图片时不能蹭掉它的边
         keep_bar = (bars > 0) & (cv2.dilate(mask, np.ones((5, 5), np.uint8)) == 0)
         clean[keep_bar] = img[keep_bar]
@@ -3991,7 +5007,7 @@ def process_image(path, engine, lang, debug_dir=None, with_icons=True, inpaint="
         clean[ly:ly + lh, lx:lx + lw][h_in] = fixed[h_in]
     refit_widths(kept)
     detect_italic(kept)
-    blocks = group_lines(kept)
+    blocks = group_lines(kept, img)
     if debug_dir:
         os.makedirs(debug_dir, exist_ok=True)
         stem = os.path.splitext(os.path.basename(path))[0]

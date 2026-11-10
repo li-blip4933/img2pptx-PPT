@@ -74,3 +74,7 @@ python -m venv .venv
 ## 协议
 
 [MIT](LICENSE)
+
+## 在线版
+
+也可以部署成一个公开网页给别人用（魔搭创空间 / Hugging Face Spaces / 自己的服务器），步骤见 [docs/deploy.md](docs/deploy.md)。

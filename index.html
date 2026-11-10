@@ -127,15 +127,16 @@
          cursor: default; transition: transform .2s cubic-bezier(.2, .9, .3, 1.3), box-shadow .2s, background-color .2s; }
   .box.t { --c: var(--text-layer); } .box.i { --c: var(--icon-layer); } .box.p { --c: var(--pic-layer); }
   .box.r { --c: #7A8497; border-style: dashed; border-width: 1.5px; background: transparent; }
+  .box.c { --c: #E0218A; border-width: 2.5px; background: transparent; }
   .box.weak { border-style: dashed; }
-  .stage.hide-t .box.t, .stage.hide-i .box.i, .stage.hide-p .box.p, .stage.hide-r .box.r { display: none; }
+  .stage.hide-t .box.t, .stage.hide-i .box.i, .stage.hide-p .box.p, .stage.hide-r .box.r, .stage.hide-c .box.c { display: none; }
   /* 每个框的置信分：平时只在图标 / 图片 / 未抠出的框上显示小标签，悬停时放大 */
   .box .score { position: absolute; left: -2px; bottom: 100%; background: var(--c); color: #fff; font: 600 10px/1 var(--mono);
                 padding: 2px 4px; pointer-events: none; transition: transform .15s; transform-origin: left bottom; }
   .box.t .score { display: none; }
   .box.t.weak .score, .box.t:hover .score { display: block; }
   .box:hover .score { transform: scale(1.35); }
-  .chip.r { --c: #7A8497; }
+  .chip.r { --c: #7A8497; } .chip.c { --c: #E0218A; }
   /* 框刚被识别出来时：弹一下 */
   .box.pop { animation: pop .42s cubic-bezier(.2, 1.5, .4, 1) both; }
   @keyframes pop { from { opacity: 0; transform: scale(.55); } to { opacity: 1; transform: scale(1); } }
@@ -298,7 +299,8 @@
     彩色方框标出的是程序识别到的元素：在 PPT 里，每个框都是一个可以单独移动的对象。每个框左上角的数字是程序给它打的置信分（满分 100）：图标要到 55 分才会被抠出来，灰色虚线框是分数不够、留在底图里的候选。把鼠标移到框上可以看分项得分。没有框住的部分留在底图里，不能单独编辑。
   </footer>
   <footer style="border-top:none;margin-top:10px;padding-top:0">
-    <a href="#" id="quitApp" style="color:inherit">关闭程序</a>（用完点这里；直接关掉网页的话程序还在后台运行，下次打开更快）
+    <span id="localOnly"><a href="#" id="quitApp" style="color:inherit">关闭程序</a>（用完点这里；直接关掉网页的话程序还在后台运行，下次打开更快）</span>
+    <span id="publicOnly" hidden>这是在线版：上传的图片和生成的 PPT 只保存在服务器上 1 小时，之后自动删除；不会用于其他用途。图片内容涉及隐私的，建议下载<a href="https://github.com/li-blip4933/img2pptx-PPT" style="color:inherit">本地版</a>在自己电脑上运行。同一时间只能处理一个任务，人多时需要排队。</span>
   </footer>
 </div>
 
@@ -306,14 +308,19 @@
 const $ = id => document.getElementById(id);
 let files = [];            // 待转换的图片
 let timer = null;
+let MAX_PAGES = null;      // 在线版每批页数上限（本地版没有）
 
 // ---------- 环境信息 ----------
 fetch('/api/info').then(r => r.json()).then(info => {
   const ocr = info.ocr === 'rapidocr' ? '<b>RapidOCR</b>（中英文）' : '<b class="warn">Tesseract</b>（未装 RapidOCR，中文可能识别不了）';
   const fill = info.lama ? '<b>LaMa 模型</b>' : '<b class="warn">快速算法</b>（未找到 LaMa 模型）';
-  $('env').innerHTML = `在本机运行 · 不联网<br>文字识别 ${ocr}<br>背景补全 ${fill}`;
+  $('env').innerHTML = `${info.public ? '在线版 · 开源免费' : '在本机运行 · 不联网'}<br>文字识别 ${ocr}<br>背景补全 ${fill}`;
+  if (info.public) {
+    MAX_PAGES = info.max_pages;
+    $('localOnly').hidden = true; $('publicOnly').hidden = false;
+  }
   if (!info.lama) { $('optFast').checked = true; $('optFast').disabled = true; }
-}).catch(() => { $('env').innerHTML = '<b class="warn">连不上本机服务</b><br>请确认 app.py 还在运行'; });
+}).catch(() => { $('env').innerHTML = '<b class="warn">连不上服务</b><br>本地版请确认 app.py 还在运行'; });
 
 // ---------- 选图 ----------
 const drop = $('drop');
@@ -321,7 +328,12 @@ const okType = f => /\.(png|jpe?g|webp|bmp)$/i.test(f.name);
 function addFiles(list) {
   const bad = [];
   for (const f of list) (okType(f) ? files : bad).push(f);
-  showErr(bad.length ? `这些文件不是图片，已跳过：${bad.map(f => f.name).join('、')}` : '');
+  let msg = bad.length ? `这些文件不是图片，已跳过：${bad.map(f => f.name).join('、')}` : '';
+  if (MAX_PAGES && files.length > MAX_PAGES) {
+    files = files.slice(0, MAX_PAGES);
+    msg += (msg ? '；' : '') + `在线版每次最多转换 ${MAX_PAGES} 张，多出来的没有加入`;
+  }
+  showErr(msg);
   renderQueue();
 }
 function renderQueue() {
@@ -352,7 +364,7 @@ document.addEventListener('paste', e => {
 });
 
 // ---------- 画识别框（识别过程和结果页共用） ----------
-const KIND = { text: ['t', '文字'], icon: ['i', '图标'], picture: ['p', '图片'], rejected: ['r', '未抠出'] };
+const KIND = { text: ['t', '文字'], icon: ['i', '图标'], picture: ['p', '图片'], rejected: ['r', '未抠出'], issue: ['c', '自检'] };
 function addBoxes(stage, kind, list, W, H, imgUrl, pop) {
   const [cls, label] = KIND[kind];
   list.forEach(([x, y, w, h, score, info], n) => {
@@ -363,6 +375,7 @@ function addBoxes(stage, kind, list, W, H, imgUrl, pop) {
     b.style.cssText = `left:${x / W * 100}%;top:${y / H * 100}%;width:${w / W * 100}%;height:${h / H * 100}%`;
     if (pop) b.style.animationDelay = `${Math.min(n * 28, 900)}ms`;
     b.dataset.tip = kind === 'text' ? `文字 · ${score} 分\n${info || ''}`
+      : kind === 'issue' ? `自检 · 请看一下\n${info || ''}`
       : kind === 'rejected' ? `未抠出 · ${score} 分（低于 55 分）\n${info || ''}`
       : `${label} · ${score} 分 · 可单独移动\n${info || ''}`;
     if (y / H > 0.8) b.classList.add('up');                    // 靠近底部的框，提示改到上方显示
@@ -452,7 +465,7 @@ async function waitJob(id, total) {
     const job = await api(`/api/jobs/${id}`);
     if (job.state === 'error') throw new Error(job.error);
     if (job.state === 'done') { showResult(job); break; }
-    $('what').textContent = job.state === 'queued' ? '排队中，前面还有一个任务' : `正在转换第 ${Math.min(job.done + 1, total)} / ${total} 张`;
+    $('what').textContent = job.state === 'queued' ? `排队中，前面还有 ${Math.max(1, job.ahead || 1)} 个任务` : `正在转换第 ${Math.min(job.done + 1, total)} / ${total} 张`;
     const part = job.live ? (ORDER.indexOf(job.live.stage) + 1) / (ORDER.length + 2) : 0;   // 页内进度
     $('fill').style.width = `${8 + ((job.done + part) / total) * 92}%`;
     updateLive(job.live);
@@ -655,6 +668,7 @@ $('redo').addEventListener('click', async () => {
 });
 function alertRedo(msg) {
   if (msg.includes('没有这个地址')) msg = '重新生成没有完成：后台程序还是旧版本。请点页面最下面的"关闭程序"，再重新打开，然后重新上传图片。';
+  if (msg.includes('找不到这个任务')) msg = '重新生成没有完成：这批图片已经过期被删除（在线版只保留 1 小时），请重新上传。';
   $('sub').textContent = msg; $('sub').style.cssText = 'color:#FFD166;font-weight:600;font-size:14px';
   window.scrollTo({ top: 0 });
 }
@@ -665,7 +679,8 @@ function showResult(job) {
   $('run').hidden = true; $('result').hidden = false;
   const n = k => job.pages.reduce((s, p) => s + p[k].length, 0);
   $('sum').textContent = `已转换 ${job.pages.length} 页`;
-  $('sub').textContent = `${n('text')} 个文本框 · ${n('icon')} 个图标 · ${n('picture')} 张图片 · 用时 ${job.seconds} 秒`;
+  job.pages.forEach(p => { p.issue = (p.issues || []).map(([x, y, w, h, msg]) => [x, y, w, h, '!', msg]); });
+  $('sub').textContent = `${n('text')} 个文本框 · ${n('icon')} 个图标 · ${n('picture')} 张图片 · 用时 ${job.seconds} 秒` + (n('issue') ? ` · 自检发现 ${n('issue')} 处可疑` : ' · 自检未发现问题');
   if (job.warnings && job.warnings.length) { $('sub').textContent += '　⚠ ' + job.warnings.join('；'); $('sub').style.cssText = 'color:#FFD166'; } else { $('sub').style.cssText = ''; }
   $('download').href = `/api/jobs/${job.id}/download`;
   $('download').textContent = `下载 ${job.download_name}`;
@@ -676,12 +691,12 @@ function showResult(job) {
     const img = document.createElement('img'); img.src = `/api/jobs/${job.id}/image/${i}/orig`; img.alt = `第 ${i + 1} 页预览`;
     stage.append(img);
     const origUrl = `/api/jobs/${job.id}/image/${i}/orig`;
-    for (const k of ['rejected', 'picture', 'icon', 'text']) addBoxes(stage, k, p[k] || [], p.w, p.h, origUrl, true);
+    for (const k of ['rejected', 'picture', 'icon', 'text', 'issue']) addBoxes(stage, k, p[k] || [], p.w, p.h, origUrl, true);
     const head = document.createElement('div'); head.className = 'page-head';
     const title = document.createElement('div'); title.className = 'title';
     title.innerHTML = `第 ${i + 1} 页<small></small>`; title.querySelector('small').textContent = `${p.name} · ${p.w}×${p.h}`;
     const chips = document.createElement('div'); chips.className = 'chips';
-    for (const [k, cls, label] of [['text', 't', '文字'], ['icon', 'i', '图标'], ['picture', 'p', '图片'], ['rejected', 'r', '未抠出']]) {
+    for (const [k, cls, label] of [['text', 't', '文字'], ['icon', 'i', '图标'], ['picture', 'p', '图片'], ['rejected', 'r', '未抠出'], ['issue', 'c', '自检']]) {
       if (!p[k]) p[k] = [];
       const c = document.createElement('button'); c.className = 'chip ' + cls; c.setAttribute('aria-pressed', 'true');
       c.innerHTML = `${label} <b>${p[k].length}</b>`;
@@ -690,9 +705,14 @@ function showResult(job) {
     }
     const base = document.createElement('button'); base.className = 'chip base'; base.setAttribute('aria-pressed', 'false'); base.textContent = '看底图';
     base.title = '把文字和抠走的元素都拿掉之后剩下的背景';
-    base.onclick = () => { const on = base.getAttribute('aria-pressed') !== 'true'; base.setAttribute('aria-pressed', on);
-                           img.src = `/api/jobs/${job.id}/image/${i}/${on ? 'clean' : 'orig'}`; };
-    chips.append(base);
+    const heat = document.createElement('button'); heat.className = 'chip base'; heat.setAttribute('aria-pressed', 'false'); heat.textContent = '看差异';
+    heat.title = '底图加上抠出的元素，和原图不一样的地方：越红差得越多（文字不算）';
+    const showAs = (btn, name) => { const on = btn.getAttribute('aria-pressed') !== 'true';
+                                    base.setAttribute('aria-pressed', false); heat.setAttribute('aria-pressed', false); btn.setAttribute('aria-pressed', on);
+                                    img.src = `/api/jobs/${job.id}/image/${i}/${on ? name : 'orig'}`; };
+    base.onclick = () => showAs(base, 'clean');
+    heat.onclick = () => showAs(heat, 'heat');
+    chips.append(base, heat);
     const edit = document.createElement('button'); edit.className = 'chip base'; edit.setAttribute('aria-pressed', 'false'); edit.textContent = '修改';
     edit.title = '改错字、删掉不该转的字、补上漏掉的字；调整图标和图片的框';
     edit.onclick = () => { const on = edit.getAttribute('aria-pressed') !== 'true'; edit.setAttribute('aria-pressed', on);
